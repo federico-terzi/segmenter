@@ -4,9 +4,16 @@ use anyhow::{bail, Context};
 
 use crate::frame::VideoFrame;
 
+#[cfg(any(
+    all(target_os = "macos", feature = "engine-onnx"),
+    all(
+        target_os = "windows",
+        any(feature = "engine-onnx", feature = "windows-default-onnx")
+    )
+))]
 mod onnx;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "engine-metal"))]
 mod metal;
 
 pub trait Engine {
@@ -21,10 +28,7 @@ pub struct EngineOptions {
 
 pub fn create_engine(options: EngineOptions) -> anyhow::Result<Box<dyn Engine>> {
     match model_extension(&options.model_path)?.as_str() {
-        "onnx" => Ok(Box::new(onnx::OnnxEngine::new(
-            options.model_path,
-            options.downsample_ratio,
-        )?)),
+        "onnx" => create_onnx_engine(options),
         "rvmmetal" => create_metal_engine(options),
         extension => bail!("unsupported model extension .{extension}; use .onnx or .rvmmetal"),
     }
@@ -45,7 +49,32 @@ fn model_extension(path: &Path) -> anyhow::Result<String> {
         .with_context(|| format!("model path must have an extension: {}", path.display()))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(
+    all(target_os = "macos", feature = "engine-onnx"),
+    all(
+        target_os = "windows",
+        any(feature = "engine-onnx", feature = "windows-default-onnx")
+    )
+))]
+fn create_onnx_engine(options: EngineOptions) -> anyhow::Result<Box<dyn Engine>> {
+    Ok(Box::new(onnx::OnnxEngine::new(
+        options.model_path,
+        options.downsample_ratio,
+    )?))
+}
+
+#[cfg(not(any(
+    all(target_os = "macos", feature = "engine-onnx"),
+    all(
+        target_os = "windows",
+        any(feature = "engine-onnx", feature = "windows-default-onnx")
+    )
+)))]
+fn create_onnx_engine(_options: EngineOptions) -> anyhow::Result<Box<dyn Engine>> {
+    bail!("the .onnx engine is not enabled; rebuild with --features engine-onnx")
+}
+
+#[cfg(all(target_os = "macos", feature = "engine-metal"))]
 fn create_metal_engine(options: EngineOptions) -> anyhow::Result<Box<dyn Engine>> {
     Ok(Box::new(metal::MetalEngine::new(
         options.model_path,
@@ -53,7 +82,12 @@ fn create_metal_engine(options: EngineOptions) -> anyhow::Result<Box<dyn Engine>
     )?))
 }
 
+#[cfg(all(target_os = "macos", not(feature = "engine-metal")))]
+fn create_metal_engine(_options: EngineOptions) -> anyhow::Result<Box<dyn Engine>> {
+    bail!("the .rvmmetal engine is not enabled; rebuild with --features engine-metal")
+}
+
 #[cfg(not(target_os = "macos"))]
 fn create_metal_engine(_options: EngineOptions) -> anyhow::Result<Box<dyn Engine>> {
-    bail!("the .rvmmetal engine is only available on macOS")
+    bail!("the .rvmmetal engine is only available on macOS with --features engine-metal")
 }
