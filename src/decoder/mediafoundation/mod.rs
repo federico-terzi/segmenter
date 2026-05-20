@@ -7,7 +7,7 @@ use windows::{
         Media::MediaFoundation::{
             IMFAttributes, IMFMediaType, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
             MFCreateSourceReaderFromURL, MFMediaType_Video, MFShutdown, MFStartup,
-            MFVideoFormat_ARGB32, MFSTARTUP_NOSOCKET, MF_API_VERSION, MF_MT_DEFAULT_STRIDE,
+            MFVideoFormat_RGB32, MFSTARTUP_NOSOCKET, MF_API_VERSION, MF_MT_DEFAULT_STRIDE,
             MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
             MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MF_SOURCE_READER_ALL_STREAMS,
             MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
@@ -23,7 +23,7 @@ use crate::{
 };
 
 pub struct MediaFoundationDecoder {
-    source_reader: IMFSourceReader,
+    source_reader: Option<IMFSourceReader>,
     input: PathBuf,
     width: u32,
     height: u32,
@@ -40,9 +40,10 @@ impl MediaFoundationDecoder {
         }
 
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
             .context("failed to initialize COM for Media Foundation")?;
         let mut decoder = Self {
-            source_reader: unsafe { std::mem::zeroed() },
+            source_reader: None,
             input: input.to_path_buf(),
             width: 0,
             height: 0,
@@ -53,10 +54,6 @@ impl MediaFoundationDecoder {
         };
 
         let result = decoder.initialize(input, options);
-        if result.is_err() {
-            decoder.com_initialized = true;
-        }
-
         result.map(|_| decoder)
     }
 
@@ -80,24 +77,28 @@ impl MediaFoundationDecoder {
             attributes
         };
 
-        self.source_reader = unsafe {
+        self.source_reader = Some(unsafe {
             MFCreateSourceReaderFromURL(PWSTR(path_wide.as_mut_ptr()), &attributes)
                 .context("failed to create Media Foundation source reader")?
-        };
-        self.duration = media_duration(&self.source_reader);
+        });
+        let source_reader = self
+            .source_reader
+            .as_ref()
+            .context("Media Foundation did not return a source reader")?;
+        self.duration = media_duration(source_reader);
 
         unsafe {
-            self.source_reader
+            source_reader
                 .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)
                 .context("failed to disable non-video streams")?;
-            self.source_reader
+            source_reader
                 .SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, true)
                 .context("failed to enable first video stream")?;
         }
 
-        let (original_width, original_height) = native_dimensions(&self.source_reader)?;
+        let (original_width, original_height) = native_dimensions(source_reader)?;
         let target_size = resize_dimensions(original_width, original_height, options.max_dimension);
-        let media_type = configure_bgra_format(&self.source_reader, target_size)?;
+        let media_type = configure_bgra_format(source_reader, target_size)?;
         let (width, height) = media_type_dimensions(&media_type)?;
         let bytes_per_row = media_type_stride(&media_type).unwrap_or(width.saturating_mul(4));
 
@@ -110,6 +111,7 @@ impl MediaFoundationDecoder {
 
 impl Drop for MediaFoundationDecoder {
     fn drop(&mut self) {
+        self.source_reader = None;
         unsafe {
             if self.mf_started {
                 let _ = MFShutdown();
@@ -126,9 +128,13 @@ impl VideoDecoder for MediaFoundationDecoder {
         let mut stream_flags = 0;
         let mut timestamp_100ns = 0;
         let mut sample = None;
+        let source_reader = self
+            .source_reader
+            .as_ref()
+            .context("Media Foundation source reader was not initialized")?;
 
         unsafe {
-            self.source_reader
+            source_reader
                 .ReadSample(
                     MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
                     0,
@@ -212,7 +218,7 @@ fn configure_bgra_format(
             .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
             .context("failed to set video media major type")?;
         media_type
-            .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32)
+            .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
             .context("failed to set video media subtype")?;
         if let Some((width, height)) = target_size {
             mf_set_attribute_size(&media_type, &MF_MT_FRAME_SIZE, width, height)?;
