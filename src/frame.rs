@@ -14,6 +14,10 @@ impl MediaTime {
 
         Ok(Self { value, timescale })
     }
+
+    pub fn as_seconds(self) -> f64 {
+        self.value as f64 / self.timescale as f64
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

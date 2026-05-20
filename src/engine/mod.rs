@@ -30,6 +30,14 @@ pub fn create_engine(options: EngineOptions) -> anyhow::Result<Box<dyn Engine>> 
     }
 }
 
+pub fn engine_label_for_model(path: &Path) -> anyhow::Result<&'static str> {
+    match model_extension(path)?.as_str() {
+        "onnx" => Ok("ONNX"),
+        "rvmmetal" => Ok("Metal"),
+        extension => bail!("unsupported model extension .{extension}; use .onnx or .rvmmetal"),
+    }
+}
+
 fn model_extension(path: &Path) -> anyhow::Result<String> {
     path.extension()
         .and_then(|extension| extension.to_str())

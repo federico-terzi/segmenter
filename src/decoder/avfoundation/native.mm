@@ -14,6 +14,22 @@ void *segd_initialize_asset(const SEGDecodeOptions *options,
 
 void segd_release_asset(void *asset) { [(AVAsset *)asset release]; }
 
+uint32_t segd_get_asset_duration(void *asset, SEGDecodeTime *duration) {
+  if (!asset || !duration) {
+    return SEGD_NOT_FOUND_ERROR;
+  }
+
+  AVAsset *av_asset = (AVAsset *)asset;
+  CMTime asset_duration = av_asset.duration;
+  if (!CMTIME_IS_NUMERIC(asset_duration) || asset_duration.timescale <= 0) {
+    return SEGD_NOT_FOUND_ERROR;
+  }
+
+  duration->value = asset_duration.value;
+  duration->timescale = asset_duration.timescale;
+  return SEGD_SUCCESS;
+}
+
 void *segd_initialize_asset_reader(const SEGDecodeOptions *options,
                                    void *asset,
                                    int32_t *error_code) {

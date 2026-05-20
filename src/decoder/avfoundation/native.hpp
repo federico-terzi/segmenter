@@ -43,6 +43,8 @@ typedef struct {
 extern "C" void *segd_initialize_asset(const SEGDecodeOptions *options,
                                        int32_t *error_code);
 extern "C" void segd_release_asset(void *asset);
+extern "C" uint32_t segd_get_asset_duration(void *asset,
+                                            SEGDecodeTime *duration);
 
 extern "C" void *segd_initialize_asset_reader(const SEGDecodeOptions *options,
                                               void *asset,

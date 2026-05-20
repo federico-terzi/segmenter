@@ -1,9 +1,13 @@
 use std::path::Path;
 
-use crate::frame::VideoFrame;
+use crate::frame::{MediaTime, VideoFrame};
 
 pub trait VideoDecoder {
     fn read_frame(&mut self) -> anyhow::Result<Option<VideoFrame>>;
+
+    fn duration(&self) -> Option<MediaTime> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -8,13 +8,13 @@ use std::{
 
 use anyhow::{bail, Context};
 use native::{
-    segd_get_sample_data, segd_initialize_asset, segd_initialize_asset_reader,
-    segd_initialize_video_track_output, segd_lock_sample, segd_read_sample, segd_release_asset,
-    segd_release_asset_reader, segd_release_sample, segd_release_track_output,
-    segd_start_asset_reader, segd_unlock_sample, SEGDecodeOptions, SEGDecodeTime, SEGDecodedSample,
-    SEGD_READ_SAMPLE_CANCELLED, SEGD_READ_SAMPLE_COMPLETED, SEGD_READ_SAMPLE_FAILED,
-    SEGD_READ_SAMPLE_NO_SAMPLE, SEGD_READ_SAMPLE_SUCCESS, SEGD_READ_SAMPLE_UNKNOWN, SEGD_SUCCESS,
-    SEGD_VIDEO_FORMAT_BGRA,
+    segd_get_asset_duration, segd_get_sample_data, segd_initialize_asset,
+    segd_initialize_asset_reader, segd_initialize_video_track_output, segd_lock_sample,
+    segd_read_sample, segd_release_asset, segd_release_asset_reader, segd_release_sample,
+    segd_release_track_output, segd_start_asset_reader, segd_unlock_sample, SEGDecodeOptions,
+    SEGDecodeTime, SEGDecodedSample, SEGD_READ_SAMPLE_CANCELLED, SEGD_READ_SAMPLE_COMPLETED,
+    SEGD_READ_SAMPLE_FAILED, SEGD_READ_SAMPLE_NO_SAMPLE, SEGD_READ_SAMPLE_SUCCESS,
+    SEGD_READ_SAMPLE_UNKNOWN, SEGD_SUCCESS, SEGD_VIDEO_FORMAT_BGRA,
 };
 
 use crate::{
@@ -26,6 +26,7 @@ pub struct AvFoundationDecoder {
     _asset: Arc<AvAsset>,
     _reader: Arc<AvAssetReader>,
     track_output: Arc<AvAssetReaderTrackOutput>,
+    duration: Option<MediaTime>,
 }
 
 impl AvFoundationDecoder {
@@ -36,6 +37,7 @@ impl AvFoundationDecoder {
 
         let native_options = Arc::new(native_options(input, options)?);
         let asset = Arc::new(AvAsset::new(native_options.clone())?);
+        let duration = asset.duration();
         let reader = Arc::new(AvAssetReader::new(native_options.clone(), asset.clone())?);
         let track_output = Arc::new(AvAssetReaderTrackOutput::new(
             native_options,
@@ -49,6 +51,7 @@ impl AvFoundationDecoder {
             _asset: asset,
             _reader: reader,
             track_output,
+            duration,
         })
     }
 }
@@ -56,6 +59,10 @@ impl AvFoundationDecoder {
 impl VideoDecoder for AvFoundationDecoder {
     fn read_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
         read_video_frame(&self.track_output.reader, &self.track_output)
+    }
+
+    fn duration(&self) -> Option<MediaTime> {
+        self.duration
     }
 }
 
@@ -101,6 +108,19 @@ impl AvAsset {
             ptr,
             _options: options,
         })
+    }
+
+    fn duration(&self) -> Option<MediaTime> {
+        let mut duration = SEGDecodeTime {
+            value: 0,
+            timescale: 0,
+        };
+        let result = unsafe { segd_get_asset_duration(self.ptr, &mut duration) };
+        if result != SEGD_SUCCESS {
+            return None;
+        }
+
+        MediaTime::new(duration.value, duration.timescale).ok()
     }
 }
 

@@ -8,9 +8,10 @@ use windows::{
             IMFAttributes, IMFMediaType, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
             MFCreateSourceReaderFromURL, MFMediaType_Video, MFShutdown, MFStartup,
             MFVideoFormat_ARGB32, MFSTARTUP_NOSOCKET, MF_API_VERSION, MF_MT_DEFAULT_STRIDE,
-            MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READERF_ENDOFSTREAM,
-            MF_SOURCE_READERF_ERROR, MF_SOURCE_READER_ALL_STREAMS,
+            MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
+            MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MF_SOURCE_READER_ALL_STREAMS,
             MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+            MF_SOURCE_READER_MEDIASOURCE,
         },
         System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
     },
@@ -27,6 +28,7 @@ pub struct MediaFoundationDecoder {
     width: u32,
     height: u32,
     bytes_per_row: u32,
+    duration: Option<MediaTime>,
     com_initialized: bool,
     mf_started: bool,
 }
@@ -45,6 +47,7 @@ impl MediaFoundationDecoder {
             width: 0,
             height: 0,
             bytes_per_row: 0,
+            duration: None,
             com_initialized: true,
             mf_started: false,
         };
@@ -81,6 +84,7 @@ impl MediaFoundationDecoder {
             MFCreateSourceReaderFromURL(PWSTR(path_wide.as_mut_ptr()), &attributes)
                 .context("failed to create Media Foundation source reader")?
         };
+        self.duration = media_duration(&self.source_reader);
 
         unsafe {
             self.source_reader
@@ -182,6 +186,10 @@ impl VideoDecoder for MediaFoundationDecoder {
 
         VideoFrame::new_bgra(self.width, self.height, self.bytes_per_row, time, data).map(Some)
     }
+
+    fn duration(&self) -> Option<MediaTime> {
+        self.duration
+    }
 }
 
 fn native_dimensions(source_reader: &IMFSourceReader) -> anyhow::Result<(u32, u32)> {
@@ -231,6 +239,16 @@ fn media_type_dimensions(media_type: &IMFMediaType) -> anyhow::Result<(u32, u32)
 
 fn media_type_stride(media_type: &IMFMediaType) -> Option<u32> {
     unsafe { media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE).ok() }
+}
+
+fn media_duration(source_reader: &IMFSourceReader) -> Option<MediaTime> {
+    let value = unsafe {
+        source_reader
+            .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
+            .ok()
+    }?;
+    let duration_100ns = i64::try_from(&value).ok()?;
+    MediaTime::new(duration_100ns, 10_000_000).ok()
 }
 
 fn resize_dimensions(width: u32, height: u32, max_dimension: Option<u32>) -> Option<(u32, u32)> {

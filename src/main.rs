@@ -3,14 +3,20 @@ mod encoder;
 mod engine;
 mod frame;
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use anyhow::{bail, Context};
 use clap::Parser;
 
 use decoder::{open_video_decoder, DecodeOptions};
 use encoder::create_video_encoder;
-use engine::{create_engine, EngineOptions};
+use engine::{create_engine, engine_label_for_model, EngineOptions};
+use frame::MediaTime;
+
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(name = "segmenter")]
@@ -44,6 +50,17 @@ fn main() -> anyhow::Result<()> {
         bail!("--max-dimension must be greater than zero when provided");
     }
 
+    let engine_label = engine_label_for_model(&args.model_path)?;
+    eprintln!(
+        "INFO: Using {engine_label} engine from model \"{}\"",
+        args.model_path.display()
+    );
+    eprintln!(
+        "INFO: Generating segmentation mask for file \"{}\"",
+        args.input.display()
+    );
+    eprintln!("INFO: Writing output file \"{}\"", args.output.display());
+
     let mut decoder = open_video_decoder(
         &args.input,
         DecodeOptions {
@@ -68,18 +85,25 @@ fn main() -> anyhow::Result<()> {
         )
     })?;
 
+    let mut progress = ProgressReporter::new(decoder.duration());
+    progress.emit_initial(0);
+
     let mut frames = 0u64;
     while let Some(frame) = decoder.read_frame()? {
+        let frame_time = frame.time;
         let mask = engine.segment(&frame)?;
         encoder.send_frame(&mask)?;
         frames += 1;
+        progress.maybe_emit(frame_time, frames);
     }
 
     if frames == 0 {
         bail!("input video did not produce any frames");
     }
 
+    progress.emit_final(frames);
     encoder.finalize()?;
+    eprintln!("DONE");
     Ok(())
 }
 
@@ -97,4 +121,78 @@ fn validate_video_path(path: &Path, label: &str) -> anyhow::Result<()> {
             extension
         ),
     }
+}
+
+struct ProgressReporter {
+    duration_seconds: Option<f64>,
+    last_emit: Option<Instant>,
+    last_reported_seconds: Option<f64>,
+    latest_current_seconds: Option<f64>,
+}
+
+impl ProgressReporter {
+    fn new(duration: Option<MediaTime>) -> Self {
+        Self {
+            duration_seconds: duration.map(MediaTime::as_seconds),
+            last_emit: None,
+            last_reported_seconds: None,
+            latest_current_seconds: None,
+        }
+    }
+
+    fn emit_initial(&mut self, frames: u64) {
+        self.emit(0.0, frames, Instant::now());
+    }
+
+    fn maybe_emit(&mut self, current: MediaTime, frames: u64) {
+        let now = Instant::now();
+        self.latest_current_seconds = Some(current.as_seconds());
+        if self
+            .last_emit
+            .is_some_and(|last_emit| now.duration_since(last_emit) < PROGRESS_INTERVAL)
+        {
+            return;
+        }
+
+        self.emit(current.as_seconds(), frames, now);
+    }
+
+    fn emit_final(&mut self, frames: u64) {
+        match self.duration_seconds {
+            Some(duration) if !same_displayed_time(self.last_reported_seconds, duration) => {
+                self.emit(duration, frames, Instant::now());
+            }
+            None => {
+                if let Some(current) = self.latest_current_seconds {
+                    if same_displayed_time(self.last_reported_seconds, current) {
+                        return;
+                    }
+                    self.emit(current, frames, Instant::now());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn emit(&mut self, current_seconds: f64, frames: u64, now: Instant) {
+        let current = self.clamp_current(current_seconds);
+        match self.duration_seconds {
+            Some(duration) => eprintln!("PROGRESS: {:.2}/{:.2} {frames}", current, duration),
+            None => eprintln!("PROGRESS: {:.2}/NaN {frames}", current),
+        }
+        self.last_reported_seconds = Some(current);
+        self.last_emit = Some(now);
+    }
+
+    fn clamp_current(&self, current_seconds: f64) -> f64 {
+        let current = current_seconds.max(0.0);
+        match self.duration_seconds {
+            Some(duration) => current.min(duration),
+            None => current,
+        }
+    }
+}
+
+fn same_displayed_time(current: Option<f64>, target: f64) -> bool {
+    current.is_some_and(|current| (current - target).abs() < 0.005)
 }
