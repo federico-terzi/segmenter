@@ -29,11 +29,15 @@ fn cc_config() {
     println!("cargo:rerun-if-changed=src/decoder/avfoundation/native.mm");
     println!("cargo:rerun-if-changed=src/encoder/avfoundation/native.hpp");
     println!("cargo:rerun-if-changed=src/encoder/avfoundation/native.mm");
+    println!("cargo:rerun-if-changed=src/engine/metal/native.h");
+    println!("cargo:rerun-if-changed=src/engine/metal/native.mm");
 
     cc::Build::new()
         .cpp(true)
+        .flag("-std=c++17")
         .file("src/decoder/avfoundation/native.mm")
         .file("src/encoder/avfoundation/native.mm")
+        .file("src/engine/metal/native.mm")
         .compile("segmenter_native");
 
     println!("cargo:rustc-link-lib=dylib=c++");
@@ -43,6 +47,8 @@ fn cc_config() {
     println!("cargo:rustc-link-lib=framework=CoreMedia");
     println!("cargo:rustc-link-lib=framework=CoreVideo");
     println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=MetalPerformanceShadersGraph");
 }
 
 #[cfg(not(target_os = "macos"))]

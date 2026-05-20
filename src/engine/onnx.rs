@@ -27,14 +27,14 @@ const R3_OUTPUT: &str = "r3o";
 const R4_OUTPUT: &str = "r4o";
 const RECURRENT_STATE_SHAPE: [usize; 4] = [1, 1, 1, 1];
 
-pub struct RvmSegmenter {
+pub struct OnnxEngine {
     session: Session,
     precision: RvmPrecision,
     recurrent: Vec<DynTensor>,
     downsample_ratio: Array1<f32>,
 }
 
-impl RvmSegmenter {
+impl OnnxEngine {
     pub fn new(model_path: PathBuf, downsample_ratio: f32) -> anyhow::Result<Self> {
         if !model_path.exists() {
             bail!("RVM model path does not exist: {}", model_path.display());
@@ -65,8 +65,10 @@ impl RvmSegmenter {
             downsample_ratio: Array1::from_vec(vec![downsample_ratio]),
         })
     }
+}
 
-    pub fn segment(&mut self, frame: &VideoFrame) -> anyhow::Result<VideoFrame> {
+impl crate::engine::Engine for OnnxEngine {
+    fn segment(&mut self, frame: &VideoFrame) -> anyhow::Result<VideoFrame> {
         if frame.format != PixelFormat::Bgra {
             bail!("RVM segmenter only accepts BGRA frames");
         }

@@ -1,7 +1,7 @@
 mod decoder;
 mod encoder;
+mod engine;
 mod frame;
-mod rvm;
 
 use std::path::{Path, PathBuf};
 
@@ -10,7 +10,7 @@ use clap::Parser;
 
 use decoder::{open_video_decoder, DecodeOptions};
 use encoder::create_video_encoder;
-use rvm::RvmSegmenter;
+use engine::{create_engine, EngineOptions};
 
 #[derive(Debug, Parser)]
 #[command(name = "segmenter")]
@@ -57,17 +57,20 @@ fn main() -> anyhow::Result<()> {
             args.output.display()
         )
     })?;
-    let mut segmenter = RvmSegmenter::new(args.model_path.clone(), args.downsample_ratio)
-        .with_context(|| {
-            format!(
-                "failed to initialize RVM model {}",
-                args.model_path.display()
-            )
-        })?;
+    let mut engine = create_engine(EngineOptions {
+        model_path: args.model_path.clone(),
+        downsample_ratio: args.downsample_ratio,
+    })
+    .with_context(|| {
+        format!(
+            "failed to initialize segmentation engine for {}",
+            args.model_path.display()
+        )
+    })?;
 
     let mut frames = 0u64;
     while let Some(frame) = decoder.read_frame()? {
-        let mask = segmenter.segment(&frame)?;
+        let mask = engine.segment(&frame)?;
         encoder.send_frame(&mask)?;
         frames += 1;
     }
