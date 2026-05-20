@@ -28,6 +28,10 @@ pub struct MediaFoundationDecoder {
     width: u32,
     height: u32,
     bytes_per_row: u32,
+    source_width: u32,
+    source_height: u32,
+    source_bytes_per_row: u32,
+    software_resize: Option<(u32, u32)>,
     duration: Option<MediaTime>,
     com_initialized: bool,
     mf_started: bool,
@@ -48,6 +52,10 @@ impl MediaFoundationDecoder {
             width: 0,
             height: 0,
             bytes_per_row: 0,
+            source_width: 0,
+            source_height: 0,
+            source_bytes_per_row: 0,
+            software_resize: None,
             duration: None,
             com_initialized: true,
             mf_started: false,
@@ -98,13 +106,42 @@ impl MediaFoundationDecoder {
 
         let (original_width, original_height) = native_dimensions(source_reader)?;
         let target_size = resize_dimensions(original_width, original_height, options.max_dimension);
-        let media_type = configure_bgra_format(source_reader, target_size)?;
-        let (width, height) = media_type_dimensions(&media_type)?;
-        let bytes_per_row = media_type_stride(&media_type).unwrap_or(width.saturating_mul(4));
+        let (media_type, software_resize) = match configure_bgra_format(source_reader, target_size)
+        {
+            Ok(media_type) => (media_type, None),
+            Err(error) => {
+                let Some(target_size) = target_size else {
+                    return Err(error);
+                };
+                let media_type = configure_bgra_format(source_reader, None).with_context(|| {
+                    format!(
+                        "failed to set native Media Foundation output media type after resized output was rejected: {error:#}"
+                    )
+                })?;
+                (media_type, Some(target_size))
+            }
+        };
+        let (source_width, source_height) = media_type_dimensions(&media_type)?;
+        let source_bytes_per_row =
+            media_type_stride(&media_type).unwrap_or(source_width.saturating_mul(4));
+        let (width, height, bytes_per_row) = match software_resize {
+            Some((width, height)) => (
+                width,
+                height,
+                width
+                    .checked_mul(4)
+                    .context("resized row width overflowed")?,
+            ),
+            None => (source_width, source_height, source_bytes_per_row),
+        };
 
         self.width = width;
         self.height = height;
         self.bytes_per_row = bytes_per_row;
+        self.source_width = source_width;
+        self.source_height = source_height;
+        self.source_bytes_per_row = source_bytes_per_row;
+        self.software_resize = software_resize;
         Ok(())
     }
 }
@@ -179,7 +216,7 @@ impl VideoDecoder for MediaFoundationDecoder {
             }
         }
 
-        let required_len = self.bytes_per_row as usize * self.height as usize;
+        let required_len = self.source_bytes_per_row as usize * self.source_height as usize;
         if (current_len as usize) < required_len {
             bail!(
                 "Media Foundation returned a frame buffer that is too short; got {} bytes, need {required_len}",
@@ -187,10 +224,28 @@ impl VideoDecoder for MediaFoundationDecoder {
             );
         }
         let source = unsafe { std::slice::from_raw_parts(ptr, required_len) };
-        let data = source.to_vec();
         let time = MediaTime::new(timestamp_100ns, 10_000_000)?;
 
-        VideoFrame::new_bgra(self.width, self.height, self.bytes_per_row, time, data).map(Some)
+        match self.software_resize {
+            Some((width, height)) => resize_bgra(
+                source,
+                self.source_width,
+                self.source_height,
+                self.source_bytes_per_row,
+                width,
+                height,
+                time,
+            )
+            .map(Some),
+            None => VideoFrame::new_bgra(
+                self.width,
+                self.height,
+                self.bytes_per_row,
+                time,
+                source.to_vec(),
+            )
+            .map(Some),
+        }
     }
 
     fn duration(&self) -> Option<MediaTime> {
@@ -276,6 +331,118 @@ fn resize_dimensions(width: u32, height: u32, max_dimension: Option<u32>) -> Opt
     }
 
     Some((resized_width.max(2), resized_height.max(2)))
+}
+
+fn resize_bgra(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    source_bytes_per_row: u32,
+    target_width: u32,
+    target_height: u32,
+    time: MediaTime,
+) -> anyhow::Result<VideoFrame> {
+    let target_bytes_per_row = target_width
+        .checked_mul(4)
+        .context("resized row width overflowed")?;
+    let mut data = vec![0_u8; target_bytes_per_row as usize * target_height as usize];
+
+    let source_x = sample_coordinates(target_width as usize, source_width as usize);
+    let source_y = sample_coordinates(target_height as usize, source_height as usize);
+    for (target_y, sample_y) in source_y.into_iter().enumerate() {
+        for (target_x, sample_x) in source_x.iter().copied().enumerate() {
+            let target_offset = target_y * target_bytes_per_row as usize + target_x * 4;
+            for channel in 0..4 {
+                data[target_offset + channel] =
+                    sample_bgra_channel(source, source_bytes_per_row, sample_x, sample_y, channel)?;
+            }
+        }
+    }
+
+    VideoFrame::new_bgra(
+        target_width,
+        target_height,
+        target_bytes_per_row,
+        time,
+        data,
+    )
+}
+
+fn sample_coordinates(target_len: usize, source_len: usize) -> Vec<SampleCoordinate> {
+    (0..target_len)
+        .map(|target| source_coordinate(target, target_len, source_len))
+        .collect()
+}
+
+fn source_coordinate(target: usize, target_len: usize, source_len: usize) -> SampleCoordinate {
+    if source_len <= 1 || target_len <= 1 {
+        return SampleCoordinate {
+            lower: 0,
+            upper: 0,
+            weight: 0.0,
+        };
+    }
+
+    let source = ((target as f32 + 0.5) * source_len as f32 / target_len as f32 - 0.5)
+        .clamp(0.0, (source_len - 1) as f32);
+    let lower = source.floor() as usize;
+    let upper = (lower + 1).min(source_len - 1);
+
+    SampleCoordinate {
+        lower,
+        upper,
+        weight: source - lower as f32,
+    }
+}
+
+fn sample_bgra_channel(
+    source: &[u8],
+    bytes_per_row: u32,
+    x: SampleCoordinate,
+    y: SampleCoordinate,
+    channel: usize,
+) -> anyhow::Result<u8> {
+    let top = mix(
+        source_channel(source, bytes_per_row, x.lower, y.lower, channel)? as f32,
+        source_channel(source, bytes_per_row, x.upper, y.lower, channel)? as f32,
+        x.weight,
+    );
+    let bottom = mix(
+        source_channel(source, bytes_per_row, x.lower, y.upper, channel)? as f32,
+        source_channel(source, bytes_per_row, x.upper, y.upper, channel)? as f32,
+        x.weight,
+    );
+
+    Ok(mix(top, bottom, y.weight).round().clamp(0.0, 255.0) as u8)
+}
+
+fn source_channel(
+    source: &[u8],
+    bytes_per_row: u32,
+    x: usize,
+    y: usize,
+    channel: usize,
+) -> anyhow::Result<u8> {
+    let offset = y
+        .checked_mul(bytes_per_row as usize)
+        .and_then(|offset| offset.checked_add(x.checked_mul(4)?))
+        .and_then(|offset| offset.checked_add(channel))
+        .context("resized frame source offset overflowed")?;
+    source
+        .get(offset)
+        .copied()
+        .context("resized frame source offset was out of bounds")
+}
+
+fn mix(from: f32, to: f32, amount: f32) -> f32 {
+    from + (to - from) * amount
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SampleCoordinate {
+    lower: usize,
+    upper: usize,
+    weight: f32,
 }
 
 #[allow(non_snake_case)]
