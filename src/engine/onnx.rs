@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use anyhow::{bail, Context};
 use half::f16;
 use ndarray::{Array1, Array4, ArrayView4};
+#[cfg(target_os = "windows")]
+use ort::execution_providers::DirectMLExecutionProvider;
 use ort::{
     execution_providers::{CPUExecutionProvider, ExecutionProviderDispatch},
     inputs,
@@ -337,6 +339,15 @@ fn validate_alpha_shape(shape: &[usize]) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn execution_providers() -> Vec<ExecutionProviderDispatch> {
+    vec![
+        DirectMLExecutionProvider::default().build(),
+        CPUExecutionProvider::default().build(),
+    ]
+}
+
+#[cfg(not(target_os = "windows"))]
 fn execution_providers() -> Vec<ExecutionProviderDispatch> {
     vec![CPUExecutionProvider::default().build()]
 }
