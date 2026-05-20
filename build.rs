@@ -1,4 +1,7 @@
 #[cfg(target_os = "macos")]
+const MACOS_VERSION_MIN: &str = "12.6";
+
+#[cfg(target_os = "macos")]
 fn generate_bindings(header: &str, output_file_name: &str) {
     use std::path::PathBuf;
 
@@ -17,6 +20,7 @@ fn generate_bindings(header: &str, output_file_name: &str) {
 #[cfg(target_os = "macos")]
 fn cc_config() {
     let engine_metal_enabled = std::env::var_os("CARGO_FEATURE_ENGINE_METAL").is_some();
+    let macos_version_min_flag = format!("-mmacosx-version-min={MACOS_VERSION_MIN}");
 
     generate_bindings(
         "src/decoder/avfoundation/native.hpp",
@@ -36,9 +40,12 @@ fn cc_config() {
     let mut build = cc::Build::new();
     build
         .cpp(true)
+        .flag(&macos_version_min_flag)
         .flag("-std=c++17")
         .file("src/decoder/avfoundation/native.mm")
         .file("src/encoder/avfoundation/native.mm");
+
+    println!("cargo:rustc-link-arg={macos_version_min_flag}");
 
     if engine_metal_enabled {
         println!("cargo:rerun-if-changed=src/engine/metal/native.h");
