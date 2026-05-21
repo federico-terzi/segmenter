@@ -51,7 +51,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     let engine_label = engine_label_for_model(&args.model_path)?;
-    eprintln!("INFO: Version {}", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "INFO: Version {} Arch {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH
+    );
     eprintln!(
         "INFO: Using {engine_label} engine from model \"{}\"",
         args.model_path.display()
