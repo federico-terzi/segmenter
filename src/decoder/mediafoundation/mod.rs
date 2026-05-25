@@ -48,6 +48,8 @@ impl MediaFoundationDecoder {
             bail!("input file does not exist: {}", input.display());
         }
 
+        let mp4_timescale = mp4_video_timescale(input).unwrap_or(None);
+
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
             .ok()
             .context("failed to initialize COM for Media Foundation")?;
@@ -61,7 +63,7 @@ impl MediaFoundationDecoder {
             source_height: 0,
             source_bytes_per_row: 0,
             software_resize: None,
-            timestamp_clock: TimestampClock::new(mp4_video_timescale(input).unwrap_or(None)),
+            timestamp_clock: TimestampClock::new(mp4_timescale),
             duration: None,
             com_initialized: true,
             mf_started: false,
@@ -460,18 +462,21 @@ fn read_mdhd_timescale(file: &mut File, box_end: u64) -> anyhow::Result<Option<u
         .context("failed to read MP4 mdhd payload")?;
 
     let version = *payload.first().context("MP4 mdhd box was empty")?;
-    let offset = match version {
+    let timescale_offset = match version {
         0 => 12,
         1 => 20,
         _ => return Ok(None),
     };
     let timescale = read_be_u32(
         payload
-            .get(offset..offset + 4)
+            .get(timescale_offset..timescale_offset + 4)
             .context("MP4 mdhd box was too short for timescale")?,
     );
+    if timescale == 0 {
+        return Ok(None);
+    }
 
-    Ok((timescale != 0).then_some(timescale))
+    Ok(Some(timescale))
 }
 
 fn read_hdlr_type(file: &mut File, box_end: u64) -> anyhow::Result<Option<[u8; 4]>> {
