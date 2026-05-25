@@ -641,14 +641,14 @@ fn read_mp4_box(file: &mut File, parent_end: u64) -> anyhow::Result<Option<Mp4Bo
         file.seek(SeekFrom::Current(16))
             .context("failed to skip MP4 uuid extended type")?;
     }
-    if size < header_size || start + size > parent_end {
+    let end = start
+        .checked_add(size)
+        .context("invalid MP4 box size while reading timestamps")?;
+    if size < header_size || end > parent_end {
         bail!("invalid MP4 box size while reading timestamps");
     }
 
-    Ok(Some(Mp4BoxHeader {
-        kind,
-        end: start + size,
-    }))
+    Ok(Some(Mp4BoxHeader { kind, end }))
 }
 
 fn read_be_u32(bytes: &[u8]) -> u32 {
@@ -829,9 +829,12 @@ struct TimestampClock {
 impl TimestampClock {
     fn new(preferred_timescale: Option<u32>) -> Self {
         Self {
-            preferred_scale: preferred_timescale.map(|numerator| TimestampScale {
-                numerator,
-                denominator: 1,
+            preferred_scale: preferred_timescale.and_then(|numerator| {
+                let _ = i32::try_from(numerator).ok()?;
+                (numerator > 0).then_some(TimestampScale {
+                    numerator,
+                    denominator: 1,
+                })
             }),
             observed_hns: Vec::new(),
             scale: None,
@@ -873,7 +876,9 @@ impl TimestampScale {
         let value = self.timestamp_units(timestamp_100ns);
         let value =
             i64::try_from(value).context("native-frame-clock timestamp is outside range")?;
-        MediaTime::new(value, self.numerator as i32)
+        let timescale = i32::try_from(self.numerator)
+            .context("native-frame-clock timescale is outside range")?;
+        MediaTime::new(value, timescale)
     }
 
     fn fits(self, timestamp_100ns: i64) -> bool {
@@ -1010,6 +1015,7 @@ unsafe fn mf_set_attribute_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn timestamp_clock_snaps_vfr_gop_drift_to_observed_video_grid() {
@@ -1085,6 +1091,46 @@ mod tests {
                 timescale: 15_360
             }
         );
+    }
+
+    #[test]
+    fn timestamp_clock_ignores_unrepresentable_container_timescale() {
+        let mut clock = TimestampClock::new(Some(u32::MAX));
+
+        assert_eq!(
+            clock.media_time_from_hns(0).unwrap(),
+            MediaTime {
+                value: 0,
+                timescale: 10_000_000
+            }
+        );
+    }
+
+    #[test]
+    fn read_mp4_box_rejects_overflowing_large_size() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("segmenter_mp4_overflow_{unique}.mp4"));
+
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&8_u32.to_be_bytes()).unwrap();
+            file.write_all(b"ftyp").unwrap();
+            file.write_all(&1_u32.to_be_bytes()).unwrap();
+            file.write_all(b"free").unwrap();
+            file.write_all(&u64::MAX.to_be_bytes()).unwrap();
+        }
+
+        let mut file = File::open(&path).unwrap();
+        let first = read_mp4_box(&mut file, u64::MAX).unwrap().unwrap();
+        assert_eq!(first.end, 8);
+
+        file.seek(SeekFrom::Start(first.end)).unwrap();
+        assert!(read_mp4_box(&mut file, u64::MAX).is_err());
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
