@@ -48,7 +48,7 @@ impl MediaFoundationDecoder {
             bail!("input file does not exist: {}", input.display());
         }
 
-        let mp4_timescale = mp4_video_timescale(input).unwrap_or(None);
+        let mp4_timing = mp4_video_timing(input).unwrap_or_default();
 
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
             .ok()
@@ -63,17 +63,22 @@ impl MediaFoundationDecoder {
             source_height: 0,
             source_bytes_per_row: 0,
             software_resize: None,
-            timestamp_clock: TimestampClock::new(mp4_timescale),
+            timestamp_clock: TimestampClock::new(mp4_timing.timescale),
             duration: None,
             com_initialized: true,
             mf_started: false,
         };
 
-        let result = decoder.initialize(input, options);
+        let result = decoder.initialize(input, options, mp4_timing);
         result.map(|_| decoder)
     }
 
-    fn initialize(&mut self, input: &Path, options: DecodeOptions) -> anyhow::Result<()> {
+    fn initialize(
+        &mut self,
+        input: &Path,
+        options: DecodeOptions,
+        mp4_timing: Mp4VideoTiming,
+    ) -> anyhow::Result<()> {
         unsafe { MFStartup(MF_API_VERSION, MFSTARTUP_NOSOCKET) }
             .context("failed to initialize Media Foundation")?;
         self.mf_started = true;
@@ -101,7 +106,7 @@ impl MediaFoundationDecoder {
             .source_reader
             .as_ref()
             .context("Media Foundation did not return a source reader")?;
-        self.duration = media_duration(source_reader);
+        self.duration = media_duration(source_reader, mp4_timing);
 
         unsafe {
             source_reader
@@ -307,13 +312,28 @@ fn media_type_stride(media_type: &IMFMediaType) -> Option<u32> {
     unsafe { media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE).ok() }
 }
 
-fn media_duration(source_reader: &IMFSourceReader) -> Option<MediaTime> {
+fn media_duration(
+    source_reader: &IMFSourceReader,
+    mp4_timing: Mp4VideoTiming,
+) -> Option<MediaTime> {
+    let duration = media_foundation_duration(source_reader);
+    if duration.is_some_and(|duration| mp4_timing.matches_unknown_mdhd_duration(duration)) {
+        return mp4_timing.duration;
+    }
+
+    duration.or(mp4_timing.duration)
+}
+
+fn media_foundation_duration(source_reader: &IMFSourceReader) -> Option<MediaTime> {
     let value = unsafe {
         source_reader
             .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
             .ok()
     }?;
     let duration_100ns = i64::try_from(&value).ok()?;
+    if duration_100ns <= 0 {
+        return None;
+    }
     MediaTime::new(duration_100ns, 10_000_000).ok()
 }
 
@@ -373,7 +393,7 @@ fn resize_bgra(
     )
 }
 
-fn mp4_video_timescale(path: &Path) -> anyhow::Result<Option<u32>> {
+fn mp4_video_timing(path: &Path) -> anyhow::Result<Mp4VideoTiming> {
     if !matches!(
         path.extension()
             .and_then(|extension| extension.to_str())
@@ -381,7 +401,7 @@ fn mp4_video_timescale(path: &Path) -> anyhow::Result<Option<u32>> {
             .as_deref(),
         Some("mp4" | "m4v" | "mov")
     ) {
-        return Ok(None);
+        return Ok(Mp4VideoTiming::default());
     }
 
     let mut file = File::open(path).with_context(|| {
@@ -397,28 +417,28 @@ fn mp4_video_timescale(path: &Path) -> anyhow::Result<Option<u32>> {
 
     while let Some(box_header) = read_mp4_box(&mut file, len)? {
         if box_header.kind == *b"moov" {
-            return find_video_track_timescale(&mut file, box_header.end);
+            return find_video_track_timing(&mut file, box_header.end);
         }
         file.seek(SeekFrom::Start(box_header.end))
             .context("failed to skip MP4 box")?;
     }
 
-    Ok(None)
+    Ok(Mp4VideoTiming::default())
 }
 
-fn find_video_track_timescale(file: &mut File, moov_end: u64) -> anyhow::Result<Option<u32>> {
+fn find_video_track_timing(file: &mut File, moov_end: u64) -> anyhow::Result<Mp4VideoTiming> {
     while let Some(box_header) = read_mp4_box(file, moov_end)? {
         if box_header.kind == *b"trak" {
             let track = read_track_info(file, box_header.end)?;
             if track.handler_type == Some(*b"vide") {
-                return Ok(track.timescale);
+                return Ok(track.video_timing());
             }
         }
         file.seek(SeekFrom::Start(box_header.end))
             .context("failed to skip MP4 track box")?;
     }
 
-    Ok(None)
+    Ok(Mp4VideoTiming::default())
 }
 
 fn read_track_info(file: &mut File, trak_end: u64) -> anyhow::Result<Mp4TrackInfo> {
@@ -440,8 +460,14 @@ fn read_media_info(file: &mut File, mdia_end: u64) -> anyhow::Result<Mp4TrackInf
 
     while let Some(box_header) = read_mp4_box(file, mdia_end)? {
         match &box_header.kind {
-            b"mdhd" => track.timescale = read_mdhd_timescale(file, box_header.end)?,
+            b"mdhd" => {
+                let timing = read_mdhd_timing(file, box_header.end)?;
+                track.timescale = timing.timescale;
+                track.mdhd_duration_units = timing.duration_units;
+                track.unknown_mdhd_duration_units = timing.unknown_duration_units;
+            }
             b"hdlr" => track.handler_type = read_hdlr_type(file, box_header.end)?,
+            b"minf" => track.stts_duration_units = read_minf_stts_duration(file, box_header.end)?,
             _ => {}
         }
         file.seek(SeekFrom::Start(box_header.end))
@@ -451,7 +477,7 @@ fn read_media_info(file: &mut File, mdia_end: u64) -> anyhow::Result<Mp4TrackInf
     Ok(track)
 }
 
-fn read_mdhd_timescale(file: &mut File, box_end: u64) -> anyhow::Result<Option<u32>> {
+fn read_mdhd_timing(file: &mut File, box_end: u64) -> anyhow::Result<MdhdTiming> {
     let payload_start = file
         .stream_position()
         .context("failed to read MP4 mdhd position")?;
@@ -461,11 +487,15 @@ fn read_mdhd_timescale(file: &mut File, box_end: u64) -> anyhow::Result<Option<u
     file.read_exact(&mut payload)
         .context("failed to read MP4 mdhd payload")?;
 
+    mdhd_timing_from_payload(&payload)
+}
+
+fn mdhd_timing_from_payload(payload: &[u8]) -> anyhow::Result<MdhdTiming> {
     let version = *payload.first().context("MP4 mdhd box was empty")?;
-    let timescale_offset = match version {
-        0 => 12,
-        1 => 20,
-        _ => return Ok(None),
+    let (timescale_offset, duration_offset, duration_len) = match version {
+        0 => (12, 16, 4),
+        1 => (20, 24, 8),
+        _ => return Ok(MdhdTiming::default()),
     };
     let timescale = read_be_u32(
         payload
@@ -473,10 +503,31 @@ fn read_mdhd_timescale(file: &mut File, box_end: u64) -> anyhow::Result<Option<u
             .context("MP4 mdhd box was too short for timescale")?,
     );
     if timescale == 0 {
-        return Ok(None);
+        return Ok(MdhdTiming::default());
     }
 
-    Ok(Some(timescale))
+    let duration = payload
+        .get(duration_offset..duration_offset + duration_len)
+        .context("MP4 mdhd box was too short for duration")?;
+    let duration_units = if duration_len == 4 {
+        read_be_u32(duration) as u64
+    } else {
+        read_be_u64(duration)
+    };
+    let unknown_duration_units = match (duration_len, duration_units) {
+        (_, 0) => None,
+        (4, units) if units == u32::MAX as u64 => Some(units),
+        (8, u64::MAX) => Some(u64::MAX),
+        _ => None,
+    };
+    let duration_units =
+        (duration_units != 0 && unknown_duration_units.is_none()).then_some(duration_units);
+
+    Ok(MdhdTiming {
+        timescale: Some(timescale),
+        duration_units,
+        unknown_duration_units,
+    })
 }
 
 fn read_hdlr_type(file: &mut File, box_end: u64) -> anyhow::Result<Option<[u8; 4]>> {
@@ -493,6 +544,70 @@ fn read_hdlr_type(file: &mut File, box_end: u64) -> anyhow::Result<Option<[u8; 4
         .get(8..12)
         .context("MP4 hdlr box was too short for handler type")?;
     Ok(Some([handler[0], handler[1], handler[2], handler[3]]))
+}
+
+fn read_minf_stts_duration(file: &mut File, minf_end: u64) -> anyhow::Result<Option<u64>> {
+    let mut duration = None;
+    while let Some(box_header) = read_mp4_box(file, minf_end)? {
+        if box_header.kind == *b"stbl" {
+            duration = read_stbl_stts_duration(file, box_header.end)?;
+        }
+        file.seek(SeekFrom::Start(box_header.end))
+            .context("failed to skip MP4 media information child box")?;
+    }
+
+    Ok(duration)
+}
+
+fn read_stbl_stts_duration(file: &mut File, stbl_end: u64) -> anyhow::Result<Option<u64>> {
+    let mut duration = None;
+    while let Some(box_header) = read_mp4_box(file, stbl_end)? {
+        if box_header.kind == *b"stts" {
+            duration = read_stts_duration(file, box_header.end)?;
+        }
+        file.seek(SeekFrom::Start(box_header.end))
+            .context("failed to skip MP4 sample table child box")?;
+    }
+
+    Ok(duration)
+}
+
+fn read_stts_duration(file: &mut File, box_end: u64) -> anyhow::Result<Option<u64>> {
+    let payload_start = file
+        .stream_position()
+        .context("failed to read MP4 stts position")?;
+    let payload_len = box_end.saturating_sub(payload_start);
+    if payload_len < 8 {
+        bail!("MP4 stts box was too short");
+    }
+
+    let mut header = [0_u8; 8];
+    file.read_exact(&mut header)
+        .context("failed to read MP4 stts header")?;
+    let entry_count = read_be_u32(&header[4..8]) as u64;
+    let entries_len = entry_count
+        .checked_mul(8)
+        .context("MP4 stts entry table size overflowed")?;
+    if payload_len - 8 < entries_len {
+        bail!("MP4 stts box was too short for entries");
+    }
+
+    let mut duration = 0_u64;
+    for _ in 0..entry_count {
+        let mut entry = [0_u8; 8];
+        file.read_exact(&mut entry)
+            .context("failed to read MP4 stts entry")?;
+        let sample_count = read_be_u32(&entry[0..4]) as u64;
+        let sample_delta = read_be_u32(&entry[4..8]) as u64;
+        let entry_duration = sample_count
+            .checked_mul(sample_delta)
+            .context("MP4 stts duration overflowed")?;
+        duration = duration
+            .checked_add(entry_duration)
+            .context("MP4 stts duration overflowed")?;
+    }
+
+    Ok((duration != 0).then_some(duration))
 }
 
 fn read_mp4_box(file: &mut File, parent_end: u64) -> anyhow::Result<Option<Mp4BoxHeader>> {
@@ -552,10 +667,73 @@ struct Mp4BoxHeader {
     end: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct Mp4VideoTiming {
+    timescale: Option<u32>,
+    duration: Option<MediaTime>,
+    unknown_mdhd_duration: Option<Mp4UnknownDuration>,
+}
+
+impl Mp4VideoTiming {
+    fn matches_unknown_mdhd_duration(self, duration: MediaTime) -> bool {
+        self.unknown_mdhd_duration
+            .is_some_and(|unknown| unknown.matches(duration))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Mp4UnknownDuration {
+    units: u64,
+    timescale: u32,
+}
+
+impl Mp4UnknownDuration {
+    fn matches(self, duration: MediaTime) -> bool {
+        let unknown_seconds = self.units as f64 / self.timescale as f64;
+        let tolerance_seconds = 1.0_f64.max(2.0 / self.timescale as f64);
+        (duration.as_seconds() - unknown_seconds).abs() <= tolerance_seconds
+    }
+}
+
+#[derive(Default)]
+struct MdhdTiming {
+    timescale: Option<u32>,
+    duration_units: Option<u64>,
+    unknown_duration_units: Option<u64>,
+}
+
 #[derive(Default)]
 struct Mp4TrackInfo {
     handler_type: Option<[u8; 4]>,
     timescale: Option<u32>,
+    mdhd_duration_units: Option<u64>,
+    unknown_mdhd_duration_units: Option<u64>,
+    stts_duration_units: Option<u64>,
+}
+
+impl Mp4TrackInfo {
+    fn video_timing(self) -> Mp4VideoTiming {
+        let duration_units = self.mdhd_duration_units.or(self.stts_duration_units);
+        Mp4VideoTiming {
+            timescale: self.timescale,
+            duration: self.timescale.and_then(|timescale| {
+                duration_units.and_then(|units| media_time_from_mp4_units(units, timescale))
+            }),
+            unknown_mdhd_duration: self.timescale.and_then(|timescale| {
+                self.unknown_mdhd_duration_units
+                    .map(|units| Mp4UnknownDuration { units, timescale })
+            }),
+        }
+    }
+}
+
+fn media_time_from_mp4_units(units: u64, timescale: u32) -> Option<MediaTime> {
+    if units == 0 {
+        return None;
+    }
+    let value = i64::try_from(units).ok()?;
+    let timescale = i32::try_from(timescale).ok()?;
+    MediaTime::new(value, timescale).ok()
 }
 
 fn sample_coordinates(target_len: usize, source_len: usize) -> Vec<SampleCoordinate> {
@@ -907,5 +1085,53 @@ mod tests {
                 timescale: 15_360
             }
         );
+    }
+
+    #[test]
+    fn mdhd_all_ones_duration_is_marked_unknown() {
+        let mut payload = [0_u8; 20];
+        payload[12..16].copy_from_slice(&10_240_u32.to_be_bytes());
+        payload[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        let timing = mdhd_timing_from_payload(&payload).unwrap();
+
+        assert_eq!(timing.timescale, Some(10_240));
+        assert_eq!(timing.duration_units, None);
+        assert_eq!(timing.unknown_duration_units, Some(u32::MAX as u64));
+    }
+
+    #[test]
+    fn mp4_timing_uses_stts_duration_when_mdhd_duration_is_unknown() {
+        let track = Mp4TrackInfo {
+            timescale: Some(10_240),
+            unknown_mdhd_duration_units: Some(u32::MAX as u64),
+            stts_duration_units: Some(10_240),
+            ..Mp4TrackInfo::default()
+        };
+
+        assert_eq!(
+            track.video_timing().duration,
+            Some(MediaTime {
+                value: 10_240,
+                timescale: 10_240
+            })
+        );
+    }
+
+    #[test]
+    fn mp4_unknown_duration_matches_media_foundation_rounded_sentinel() {
+        let timing = Mp4VideoTiming {
+            timescale: Some(10_240),
+            unknown_mdhd_duration: Some(Mp4UnknownDuration {
+                units: u32::MAX as u64,
+                timescale: 10_240,
+            }),
+            ..Mp4VideoTiming::default()
+        };
+
+        assert!(timing.matches_unknown_mdhd_duration(MediaTime {
+            value: 4_194_304_000_000,
+            timescale: 10_000_000,
+        }));
     }
 }
