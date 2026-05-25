@@ -73,12 +73,14 @@ fn main() -> anyhow::Result<()> {
         },
     )
     .with_context(|| format!("failed to open video decoder for {}", args.input.display()))?;
+    let duration = decoder.duration();
     let mut encoder = create_video_encoder(&args.output).with_context(|| {
         format!(
             "failed to create video encoder for {}",
             args.output.display()
         )
     })?;
+    encoder.set_expected_duration(duration)?;
     let mut engine = create_engine(EngineOptions {
         model_path: args.model_path.clone(),
         downsample_ratio: args.downsample_ratio,
@@ -90,7 +92,7 @@ fn main() -> anyhow::Result<()> {
         )
     })?;
 
-    let mut progress = ProgressReporter::new(decoder.duration());
+    let mut progress = ProgressReporter::new(duration);
     progress.emit_initial(0);
 
     let mut frames = 0u64;

@@ -1,8 +1,12 @@
 use std::path::Path;
 
-use crate::frame::VideoFrame;
+use crate::frame::{MediaTime, VideoFrame};
 
 pub trait VideoEncoder {
+    fn set_expected_duration(&mut self, _duration: Option<MediaTime>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn send_frame(&mut self, frame: &VideoFrame) -> anyhow::Result<()>;
     fn finalize(&mut self) -> anyhow::Result<()>;
 }
