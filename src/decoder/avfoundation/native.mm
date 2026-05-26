@@ -3,6 +3,18 @@
 #import <Foundation/Foundation.h>
 #include <math.h>
 
+static bool segd_nearly_equal(CGFloat value, CGFloat expected) {
+  return fabs((double)value - (double)expected) < 0.0001;
+}
+
+static bool segd_transform_matches(CGAffineTransform transform, CGFloat a,
+                                   CGFloat b, CGFloat c, CGFloat d) {
+  return segd_nearly_equal(transform.a, a) &&
+         segd_nearly_equal(transform.b, b) &&
+         segd_nearly_equal(transform.c, c) &&
+         segd_nearly_equal(transform.d, d);
+}
+
 void *segd_initialize_asset(const SEGDecodeOptions *options,
                             int32_t *error_code) {
   (void)error_code;
@@ -47,9 +59,18 @@ uint32_t segd_get_asset_rotation(void *asset, int32_t *rotation) {
   }
 
   CGAffineTransform transform = [video_track preferredTransform];
-  double degrees =
-      atan2(transform.b, transform.a) * 180.0 / 3.14159265358979323846;
-  *rotation = (int32_t)lround(degrees);
+  if (segd_transform_matches(transform, 1, 0, 0, 1)) {
+    *rotation = 0;
+  } else if (segd_transform_matches(transform, 0, 1, -1, 0)) {
+    *rotation = 90;
+  } else if (segd_transform_matches(transform, -1, 0, 0, -1)) {
+    *rotation = 180;
+  } else if (segd_transform_matches(transform, 0, -1, 1, 0)) {
+    *rotation = -90;
+  } else {
+    return SEGD_NOT_FOUND_ERROR;
+  }
+
   return SEGD_SUCCESS;
 }
 

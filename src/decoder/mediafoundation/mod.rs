@@ -50,12 +50,7 @@ impl MediaFoundationDecoder {
             bail!("input file does not exist: {}", input.display());
         }
 
-        let mp4_timing = mp4_video_timing(input).with_context(|| {
-            format!(
-                "failed to inspect MP4 video metadata for {}",
-                input.display()
-            )
-        })?;
+        let mp4_timing = mp4_video_timing(input).unwrap_or_default();
 
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
             .ok()
@@ -678,12 +673,13 @@ fn read_tkhd_rotation(file: &mut File, box_end: u64) -> anyhow::Result<Option<Di
     file.read_exact(&mut matrix)
         .context("failed to read MP4 tkhd display matrix")?;
 
-    Ok(Some(rotation_from_mp4_matrix(
+    Ok(rotation_from_mp4_matrix(
         read_be_i32(&matrix[0..4]),
         read_be_i32(&matrix[4..8]),
         read_be_i32(&matrix[12..16]),
         read_be_i32(&matrix[16..20]),
-    )?))
+    )
+    .ok())
 }
 
 fn rotation_from_mp4_matrix(a: i32, b: i32, c: i32, d: i32) -> anyhow::Result<DisplayRotation> {
@@ -1460,6 +1456,28 @@ mod tests {
     #[test]
     fn mp4_display_matrix_rejects_skew() {
         assert!(rotation_from_mp4_matrix(65_536, 1, 0, 65_536).is_err());
+    }
+
+    #[test]
+    fn tkhd_rotation_ignores_unsupported_display_matrix() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("segmenter_tkhd_hflip_{unique}.bin"));
+        let mut payload = vec![0_u8; 76];
+        payload[40..44].copy_from_slice(&(-65_536_i32).to_be_bytes());
+        payload[56..60].copy_from_slice(&65_536_i32.to_be_bytes());
+
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&payload).unwrap();
+        }
+
+        let mut file = File::open(&path).unwrap();
+        assert_eq!(read_tkhd_rotation(&mut file, 76).unwrap(), None);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
