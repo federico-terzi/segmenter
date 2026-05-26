@@ -1,6 +1,7 @@
 #include "./native.hpp"
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
+#include <math.h>
 
 void *segd_initialize_asset(const SEGDecodeOptions *options,
                             int32_t *error_code) {
@@ -27,6 +28,28 @@ uint32_t segd_get_asset_duration(void *asset, SEGDecodeTime *duration) {
 
   duration->value = asset_duration.value;
   duration->timescale = asset_duration.timescale;
+  return SEGD_SUCCESS;
+}
+
+uint32_t segd_get_asset_rotation(void *asset, int32_t *rotation) {
+  if (!asset || !rotation) {
+    return SEGD_NOT_FOUND_ERROR;
+  }
+
+  AVAsset *av_asset = (AVAsset *)asset;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  AVAssetTrack *video_track =
+      [[av_asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+#pragma clang diagnostic pop
+  if (!video_track) {
+    return SEGD_NOT_FOUND_ERROR;
+  }
+
+  CGAffineTransform transform = [video_track preferredTransform];
+  double degrees =
+      atan2(transform.b, transform.a) * 180.0 / 3.14159265358979323846;
+  *rotation = (int32_t)lround(degrees);
   return SEGD_SUCCESS;
 }
 

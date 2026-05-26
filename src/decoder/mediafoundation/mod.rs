@@ -13,9 +13,10 @@ use windows::{
             MFCreateSourceReaderFromURL, MFGetStrideForBitmapInfoHeader, MFMediaType_Video,
             MFShutdown, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_NOSOCKET, MF_API_VERSION,
             MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-            MF_PD_DURATION, MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR,
-            MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
-            MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
+            MF_MT_VIDEO_ROTATION, MF_PD_DURATION, MF_SOURCE_READERF_ENDOFSTREAM,
+            MF_SOURCE_READERF_ERROR, MF_SOURCE_READER_ALL_STREAMS,
+            MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+            MF_SOURCE_READER_MEDIASOURCE,
         },
         System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
     },
@@ -23,7 +24,7 @@ use windows::{
 
 use crate::{
     decoder::{DecodeOptions, VideoDecoder},
-    frame::{MediaTime, VideoFrame},
+    frame::{DisplayRotation, MediaTime, VideoFrame},
 };
 
 pub struct MediaFoundationDecoder {
@@ -36,6 +37,7 @@ pub struct MediaFoundationDecoder {
     source_height: u32,
     source_bytes_per_row: u32,
     software_resize: Option<(u32, u32)>,
+    display_rotation: DisplayRotation,
     timestamp_clock: TimestampClock,
     duration: Option<MediaTime>,
     com_initialized: bool,
@@ -48,7 +50,12 @@ impl MediaFoundationDecoder {
             bail!("input file does not exist: {}", input.display());
         }
 
-        let mp4_timing = mp4_video_timing(input).unwrap_or_default();
+        let mp4_timing = mp4_video_timing(input).with_context(|| {
+            format!(
+                "failed to inspect MP4 video metadata for {}",
+                input.display()
+            )
+        })?;
 
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
             .ok()
@@ -63,6 +70,7 @@ impl MediaFoundationDecoder {
             source_height: 0,
             source_bytes_per_row: 0,
             software_resize: None,
+            display_rotation: DisplayRotation::None,
             timestamp_clock: TimestampClock::new(mp4_timing.timescale),
             duration: None,
             com_initialized: true,
@@ -119,6 +127,9 @@ impl MediaFoundationDecoder {
 
         let native_media_type = native_media_type(source_reader)?;
         let (original_width, original_height) = media_type_dimensions(&native_media_type)?;
+        let display_rotation = media_type_rotation(&native_media_type)?
+            .or(mp4_timing.rotation)
+            .unwrap_or(DisplayRotation::None);
         let target_size = resize_dimensions(original_width, original_height, options.max_dimension);
         let (media_type, software_resize) = match configure_bgra_format(source_reader, target_size)
         {
@@ -155,6 +166,7 @@ impl MediaFoundationDecoder {
         self.source_height = source_height;
         self.source_bytes_per_row = source_bytes_per_row;
         self.software_resize = software_resize;
+        self.display_rotation = display_rotation;
         Ok(())
     }
 }
@@ -249,7 +261,7 @@ impl VideoDecoder for MediaFoundationDecoder {
         let source = unsafe { std::slice::from_raw_parts(ptr, required_len) };
         let time = self.timestamp_clock.media_time_from_hns(timestamp_100ns)?;
 
-        match self.software_resize {
+        let frame = match self.software_resize {
             Some((width, height)) => resize_bgra(
                 source,
                 self.source_width,
@@ -258,17 +270,17 @@ impl VideoDecoder for MediaFoundationDecoder {
                 width,
                 height,
                 time,
-            )
-            .map(Some),
+            ),
             None => VideoFrame::new_bgra(
                 self.width,
                 self.height,
                 source_bytes_per_row,
                 time,
                 source.to_vec(),
-            )
-            .map(Some),
-        }
+            ),
+        }?;
+
+        frame.rotated(self.display_rotation).map(Some)
     }
 
     fn duration(&self) -> Option<MediaTime> {
@@ -315,6 +327,17 @@ fn media_type_dimensions(media_type: &IMFMediaType) -> anyhow::Result<(u32, u32)
     let frame_size = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }
         .context("failed to get video frame size")?;
     Ok(((frame_size >> 32) as u32, (frame_size & 0xFFFF_FFFF) as u32))
+}
+
+fn media_type_rotation(media_type: &IMFMediaType) -> anyhow::Result<Option<DisplayRotation>> {
+    let Ok(rotation) = (unsafe { media_type.GetUINT32(&MF_MT_VIDEO_ROTATION) }) else {
+        return Ok(None);
+    };
+
+    let rotation = DisplayRotation::from_clockwise_degrees(rotation as i32).with_context(|| {
+        format!("unsupported Media Foundation video rotation {rotation} degrees")
+    })?;
+    Ok((rotation != DisplayRotation::None).then_some(rotation))
 }
 
 fn media_type_stride(media_type: &IMFMediaType, width: u32) -> anyhow::Result<u32> {
@@ -506,14 +529,77 @@ fn read_track_info(file: &mut File, trak_end: u64) -> anyhow::Result<Mp4TrackInf
     let mut track = Mp4TrackInfo::default();
 
     while let Some(box_header) = read_mp4_box(file, trak_end)? {
-        if box_header.kind == *b"mdia" {
-            track = read_media_info(file, box_header.end)?;
+        match &box_header.kind {
+            b"tkhd" => track.rotation = read_tkhd_rotation(file, box_header.end)?,
+            b"mdia" => {
+                let media = read_media_info(file, box_header.end)?;
+                track.handler_type = media.handler_type;
+                track.timescale = media.timescale;
+                track.mdhd_duration_units = media.mdhd_duration_units;
+                track.unknown_mdhd_duration_units = media.unknown_mdhd_duration_units;
+                track.stts_duration_units = media.stts_duration_units;
+            }
+            _ => {}
         }
         file.seek(SeekFrom::Start(box_header.end))
             .context("failed to skip MP4 track child box")?;
     }
 
     Ok(track)
+}
+
+fn read_tkhd_rotation(file: &mut File, box_end: u64) -> anyhow::Result<Option<DisplayRotation>> {
+    let payload_start = file
+        .stream_position()
+        .context("failed to read MP4 tkhd position")?;
+    let payload_len = box_end.saturating_sub(payload_start);
+    if payload_len == 0 {
+        bail!("MP4 tkhd box was empty");
+    }
+
+    let mut version = [0_u8; 1];
+    file.read_exact(&mut version)
+        .context("failed to read MP4 tkhd version")?;
+    let matrix_offset = match version[0] {
+        0 => 40_u64,
+        1 => 52_u64,
+        version => bail!("unsupported MP4 tkhd version {version}"),
+    };
+    let matrix_end = matrix_offset + 36;
+    if payload_len < matrix_end {
+        bail!("MP4 tkhd box was too short for display matrix");
+    }
+
+    file.seek(SeekFrom::Start(payload_start + matrix_offset))
+        .context("failed to seek to MP4 tkhd display matrix")?;
+    let mut matrix = [0_u8; 36];
+    file.read_exact(&mut matrix)
+        .context("failed to read MP4 tkhd display matrix")?;
+
+    Ok(Some(rotation_from_mp4_matrix(
+        read_be_i32(&matrix[0..4]),
+        read_be_i32(&matrix[4..8]),
+        read_be_i32(&matrix[12..16]),
+        read_be_i32(&matrix[16..20]),
+    )?))
+}
+
+fn rotation_from_mp4_matrix(a: i32, b: i32, c: i32, d: i32) -> anyhow::Result<DisplayRotation> {
+    const SCALE: i32 = 65_536;
+
+    if (a, b, c, d) == (SCALE, 0, 0, SCALE) {
+        Ok(DisplayRotation::None)
+    } else if (a, b, c, d) == (0, SCALE, -SCALE, 0) {
+        Ok(DisplayRotation::Clockwise90)
+    } else if (a, b, c, d) == (-SCALE, 0, 0, -SCALE) {
+        Ok(DisplayRotation::Clockwise180)
+    } else if (a, b, c, d) == (0, -SCALE, SCALE, 0) {
+        Ok(DisplayRotation::Clockwise270)
+    } else {
+        bail!(
+            "unsupported MP4 display matrix [{a}, {b}; {c}, {d}]; expected a right-angle rotation"
+        )
+    }
 }
 
 fn read_media_info(file: &mut File, mdia_end: u64) -> anyhow::Result<Mp4TrackInfo> {
@@ -716,6 +802,10 @@ fn read_be_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+fn read_be_i32(bytes: &[u8]) -> i32 {
+    i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
 fn read_be_u64(bytes: &[u8]) -> u64 {
     u64::from_be_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -733,6 +823,7 @@ struct Mp4VideoTiming {
     timescale: Option<u32>,
     duration: Option<MediaTime>,
     unknown_mdhd_duration: Option<Mp4UnknownDuration>,
+    rotation: Option<DisplayRotation>,
 }
 
 impl Mp4VideoTiming {
@@ -770,6 +861,7 @@ struct Mp4TrackInfo {
     mdhd_duration_units: Option<u64>,
     unknown_mdhd_duration_units: Option<u64>,
     stts_duration_units: Option<u64>,
+    rotation: Option<DisplayRotation>,
 }
 
 impl Mp4TrackInfo {
@@ -784,6 +876,7 @@ impl Mp4TrackInfo {
                 self.unknown_mdhd_duration_units
                     .map(|units| Mp4UnknownDuration { units, timescale })
             }),
+            rotation: self.rotation,
         }
     }
 }
@@ -1245,6 +1338,23 @@ mod tests {
     #[test]
     fn absolute_bgra_stride_accepts_signed_stride() {
         assert_eq!(absolute_bgra_stride(-4320, 1080).unwrap(), 4320);
+    }
+
+    #[test]
+    fn mp4_display_matrix_rotation_matches_ffmpeg_convention() {
+        assert_eq!(
+            rotation_from_mp4_matrix(0, 65_536, -65_536, 0).unwrap(),
+            DisplayRotation::Clockwise90
+        );
+        assert_eq!(
+            rotation_from_mp4_matrix(0, -65_536, 65_536, 0).unwrap(),
+            DisplayRotation::Clockwise270
+        );
+    }
+
+    #[test]
+    fn mp4_display_matrix_rejects_skew() {
+        assert!(rotation_from_mp4_matrix(65_536, 1, 0, 65_536).is_err());
     }
 
     #[test]

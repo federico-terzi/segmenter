@@ -8,24 +8,25 @@ use std::{
 
 use anyhow::{bail, Context};
 use native::{
-    segd_get_asset_duration, segd_get_sample_data, segd_initialize_asset,
+    segd_get_asset_duration, segd_get_asset_rotation, segd_get_sample_data, segd_initialize_asset,
     segd_initialize_asset_reader, segd_initialize_video_track_output, segd_lock_sample,
     segd_read_sample, segd_release_asset, segd_release_asset_reader, segd_release_sample,
     segd_release_track_output, segd_start_asset_reader, segd_unlock_sample, SEGDecodeOptions,
-    SEGDecodeTime, SEGDecodedSample, SEGD_READ_SAMPLE_CANCELLED, SEGD_READ_SAMPLE_COMPLETED,
-    SEGD_READ_SAMPLE_FAILED, SEGD_READ_SAMPLE_NO_SAMPLE, SEGD_READ_SAMPLE_SUCCESS,
-    SEGD_READ_SAMPLE_UNKNOWN, SEGD_SUCCESS, SEGD_VIDEO_FORMAT_BGRA,
+    SEGDecodeTime, SEGDecodedSample, SEGD_NOT_FOUND_ERROR, SEGD_READ_SAMPLE_CANCELLED,
+    SEGD_READ_SAMPLE_COMPLETED, SEGD_READ_SAMPLE_FAILED, SEGD_READ_SAMPLE_NO_SAMPLE,
+    SEGD_READ_SAMPLE_SUCCESS, SEGD_READ_SAMPLE_UNKNOWN, SEGD_SUCCESS, SEGD_VIDEO_FORMAT_BGRA,
 };
 
 use crate::{
     decoder::{DecodeOptions, VideoDecoder},
-    frame::{MediaTime, VideoFrame},
+    frame::{DisplayRotation, MediaTime, VideoFrame},
 };
 
 pub struct AvFoundationDecoder {
     _asset: Arc<AvAsset>,
     _reader: Arc<AvAssetReader>,
     track_output: Arc<AvAssetReaderTrackOutput>,
+    display_rotation: DisplayRotation,
     duration: Option<MediaTime>,
 }
 
@@ -38,6 +39,7 @@ impl AvFoundationDecoder {
         let native_options = Arc::new(native_options(input, options)?);
         let asset = Arc::new(AvAsset::new(native_options.clone())?);
         let duration = asset.duration();
+        let display_rotation = asset.display_rotation()?;
         let reader = Arc::new(AvAssetReader::new(native_options.clone(), asset.clone())?);
         let track_output = Arc::new(AvAssetReaderTrackOutput::new(
             native_options,
@@ -51,6 +53,7 @@ impl AvFoundationDecoder {
             _asset: asset,
             _reader: reader,
             track_output,
+            display_rotation,
             duration,
         })
     }
@@ -58,7 +61,11 @@ impl AvFoundationDecoder {
 
 impl VideoDecoder for AvFoundationDecoder {
     fn read_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
-        read_video_frame(&self.track_output.reader, &self.track_output)
+        read_video_frame(
+            &self.track_output.reader,
+            &self.track_output,
+            self.display_rotation,
+        )
     }
 
     fn duration(&self) -> Option<MediaTime> {
@@ -121,6 +128,20 @@ impl AvAsset {
         }
 
         MediaTime::new(duration.value, duration.timescale).ok()
+    }
+
+    fn display_rotation(&self) -> anyhow::Result<DisplayRotation> {
+        let mut rotation = 0;
+        let result = unsafe { segd_get_asset_rotation(self.ptr, &mut rotation) };
+        if result == SEGD_NOT_FOUND_ERROR {
+            return Ok(DisplayRotation::None);
+        }
+        if result != SEGD_SUCCESS {
+            bail!("failed to read AVFoundation video rotation: {result}");
+        }
+
+        DisplayRotation::from_clockwise_degrees(rotation)
+            .with_context(|| format!("unsupported AVFoundation video rotation {rotation} degrees"))
     }
 }
 
@@ -212,6 +233,7 @@ impl Drop for AvAssetReaderTrackOutput {
 fn read_video_frame(
     reader: &AvAssetReader,
     track_output: &AvAssetReaderTrackOutput,
+    display_rotation: DisplayRotation,
 ) -> anyhow::Result<Option<VideoFrame>> {
     let mut sample = SEGDecodedSample {
         sample_buffer: std::ptr::null_mut(),
@@ -257,14 +279,15 @@ fn read_video_frame(
     let data = source.to_vec();
     let time = MediaTime::new(sample.sample.pts.value, sample.sample.pts.timescale)?;
 
-    VideoFrame::new_bgra(
+    let frame = VideoFrame::new_bgra(
         sample.sample.width,
         sample.sample.height,
         sample_data.bytes_per_row[0],
         time,
         data,
-    )
-    .map(Some)
+    )?;
+
+    frame.rotated(display_rotation).map(Some)
 }
 
 struct NativeSample {

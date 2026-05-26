@@ -1,6 +1,50 @@
 use anyhow::{bail, Context};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayRotation {
+    None,
+    Clockwise90,
+    Clockwise180,
+    Clockwise270,
+}
+
+impl DisplayRotation {
+    pub fn from_clockwise_degrees(degrees: i32) -> anyhow::Result<Self> {
+        match degrees.rem_euclid(360) {
+            0 => Ok(Self::None),
+            90 => Ok(Self::Clockwise90),
+            180 => Ok(Self::Clockwise180),
+            270 => Ok(Self::Clockwise270),
+            degrees => bail!(
+                "unsupported video display rotation {degrees} degrees; expected 0, 90, 180, or 270"
+            ),
+        }
+    }
+
+    fn output_dimensions(self, width: u32, height: u32) -> (u32, u32) {
+        match self {
+            Self::None | Self::Clockwise180 => (width, height),
+            Self::Clockwise90 | Self::Clockwise270 => (height, width),
+        }
+    }
+
+    fn source_coordinate(
+        self,
+        target_x: u32,
+        target_y: u32,
+        width: u32,
+        height: u32,
+    ) -> (u32, u32) {
+        match self {
+            Self::None => (target_x, target_y),
+            Self::Clockwise90 => (target_y, height - 1 - target_x),
+            Self::Clockwise180 => (width - 1 - target_x, height - 1 - target_y),
+            Self::Clockwise270 => (width - 1 - target_y, target_x),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaTime {
     pub value: i64,
     pub timescale: i32,
@@ -77,6 +121,38 @@ impl VideoFrame {
 
         Ok(offset)
     }
+
+    pub fn rotated(self, rotation: DisplayRotation) -> anyhow::Result<Self> {
+        if rotation == DisplayRotation::None {
+            return Ok(self);
+        }
+        if self.format != PixelFormat::Bgra {
+            bail!("video frame rotation is only implemented for BGRA frames");
+        }
+
+        let (width, height) = rotation.output_dimensions(self.width, self.height);
+        let bytes_per_row = width
+            .checked_mul(4)
+            .context("rotated frame row width overflowed")?;
+        let len = (bytes_per_row as usize)
+            .checked_mul(height as usize)
+            .context("rotated frame buffer length overflowed")?;
+        let mut data = vec![0_u8; len];
+
+        for target_y in 0..height {
+            for target_x in 0..width {
+                let (source_x, source_y) =
+                    rotation.source_coordinate(target_x, target_y, self.width, self.height);
+                let source_offset = self.checked_pixel_offset(source_x, source_y)?;
+                let target_offset =
+                    target_y as usize * bytes_per_row as usize + target_x as usize * 4;
+                data[target_offset..target_offset + 4]
+                    .copy_from_slice(&self.data[source_offset..source_offset + 4]);
+            }
+        }
+
+        Self::new_bgra(width, height, bytes_per_row, self.time, data)
+    }
 }
 
 pub fn validate_bgra_buffer(
@@ -102,4 +178,62 @@ pub fn validate_bgra_buffer(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_frame() -> VideoFrame {
+        let pixels = [
+            [1, 0, 0, 255],
+            [2, 0, 0, 255],
+            [3, 0, 0, 255],
+            [4, 0, 0, 255],
+            [5, 0, 0, 255],
+            [6, 0, 0, 255],
+        ];
+        VideoFrame::new_bgra(
+            3,
+            2,
+            12,
+            MediaTime::new(0, 1).unwrap(),
+            pixels.into_iter().flatten().collect(),
+        )
+        .unwrap()
+    }
+
+    fn first_channel(frame: &VideoFrame) -> Vec<u8> {
+        let mut values = Vec::new();
+        for y in 0..frame.height {
+            for x in 0..frame.width {
+                values.push(frame.data[frame.checked_pixel_offset(x, y).unwrap()]);
+            }
+        }
+        values
+    }
+
+    #[test]
+    fn rotates_bgra_clockwise_90() {
+        let frame = test_frame().rotated(DisplayRotation::Clockwise90).unwrap();
+
+        assert_eq!((frame.width, frame.height), (2, 3));
+        assert_eq!(first_channel(&frame), vec![4, 1, 5, 2, 6, 3]);
+    }
+
+    #[test]
+    fn rotates_bgra_clockwise_180() {
+        let frame = test_frame().rotated(DisplayRotation::Clockwise180).unwrap();
+
+        assert_eq!((frame.width, frame.height), (3, 2));
+        assert_eq!(first_channel(&frame), vec![6, 5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn rotates_bgra_clockwise_270() {
+        let frame = test_frame().rotated(DisplayRotation::Clockwise270).unwrap();
+
+        assert_eq!((frame.width, frame.height), (2, 3));
+        assert_eq!(first_channel(&frame), vec![3, 6, 2, 5, 1, 4]);
+    }
 }
