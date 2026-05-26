@@ -6,14 +6,16 @@ use std::{
 
 use anyhow::{bail, Context};
 use windows::{
-    core::{GUID, PWSTR},
+    core::{Interface, GUID, PWSTR},
     Win32::{
         Media::MediaFoundation::{
-            IMFAttributes, IMFMediaType, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
-            MFCreateSourceReaderFromURL, MFMediaType_Video, MFShutdown, MFStartup,
-            MFVideoFormat_RGB32, MFSTARTUP_NOSOCKET, MF_API_VERSION, MF_MT_DEFAULT_STRIDE,
-            MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
-            MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MF_SOURCE_READER_ALL_STREAMS,
+            IMF2DBuffer, IMF2DBuffer2, IMFAttributes, IMFMediaType, IMFSample, IMFSourceReader,
+            MF2DBuffer_LockFlags_Read, MFCreateAttributes, MFCreateMediaType,
+            MFCreateSourceReaderFromURL, MFGetStrideForBitmapInfoHeader, MFMediaType_Video,
+            MFShutdown, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_NOSOCKET, MF_API_VERSION,
+            MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+            MF_MT_VIDEO_ROTATION, MF_PD_DURATION, MF_SOURCE_READERF_ENDOFSTREAM,
+            MF_SOURCE_READERF_ERROR, MF_SOURCE_READER_ALL_STREAMS,
             MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
             MF_SOURCE_READER_MEDIASOURCE,
         },
@@ -23,7 +25,7 @@ use windows::{
 
 use crate::{
     decoder::{DecodeOptions, VideoDecoder},
-    frame::{MediaTime, VideoFrame},
+    frame::{DisplayRotation, MediaTime, VideoFrame},
 };
 
 pub struct MediaFoundationDecoder {
@@ -34,8 +36,9 @@ pub struct MediaFoundationDecoder {
     bytes_per_row: u32,
     source_width: u32,
     source_height: u32,
-    source_bytes_per_row: u32,
+    source_stride: BgraSampleStride,
     software_resize: Option<(u32, u32)>,
+    display_rotation: DisplayRotation,
     timestamp_clock: TimestampClock,
     duration: Option<MediaTime>,
     com_initialized: bool,
@@ -61,8 +64,9 @@ impl MediaFoundationDecoder {
             bytes_per_row: 0,
             source_width: 0,
             source_height: 0,
-            source_bytes_per_row: 0,
+            source_stride: BgraSampleStride::default(),
             software_resize: None,
+            display_rotation: DisplayRotation::None,
             timestamp_clock: TimestampClock::new(mp4_timing.timescale),
             duration: None,
             com_initialized: true,
@@ -119,6 +123,9 @@ impl MediaFoundationDecoder {
 
         let native_media_type = native_media_type(source_reader)?;
         let (original_width, original_height) = media_type_dimensions(&native_media_type)?;
+        let display_rotation = media_type_rotation(&native_media_type)?
+            .or(mp4_timing.rotation)
+            .unwrap_or(DisplayRotation::None);
         let target_size = resize_dimensions(original_width, original_height, options.max_dimension);
         let (media_type, software_resize) = match configure_bgra_format(source_reader, target_size)
         {
@@ -136,8 +143,7 @@ impl MediaFoundationDecoder {
             }
         };
         let (source_width, source_height) = media_type_dimensions(&media_type)?;
-        let source_bytes_per_row =
-            media_type_stride(&media_type).unwrap_or(source_width.saturating_mul(4));
+        let source_stride = media_type_stride(&media_type, source_width)?;
         let (width, height, bytes_per_row) = match software_resize {
             Some((width, height)) => (
                 width,
@@ -146,7 +152,7 @@ impl MediaFoundationDecoder {
                     .checked_mul(4)
                     .context("resized row width overflowed")?,
             ),
-            None => (source_width, source_height, source_bytes_per_row),
+            None => (source_width, source_height, source_stride.bytes_per_row),
         };
 
         self.width = width;
@@ -154,8 +160,9 @@ impl MediaFoundationDecoder {
         self.bytes_per_row = bytes_per_row;
         self.source_width = source_width;
         self.source_height = source_height;
-        self.source_bytes_per_row = source_bytes_per_row;
+        self.source_stride = source_stride;
         self.software_resize = software_resize;
+        self.display_rotation = display_rotation;
         Ok(())
     }
 }
@@ -213,6 +220,7 @@ impl VideoDecoder for MediaFoundationDecoder {
             return Ok(None);
         };
 
+        let sample_2d_stride = sample_2d_stride(&sample, self.source_width)?;
         let buffer = unsafe { sample.ConvertToContiguousBuffer() }
             .context("failed to convert Media Foundation sample to a contiguous buffer")?;
 
@@ -230,7 +238,20 @@ impl VideoDecoder for MediaFoundationDecoder {
             }
         }
 
-        let required_len = self.source_bytes_per_row as usize * self.source_height as usize;
+        if ptr.is_null() {
+            bail!("Media Foundation returned a null frame buffer");
+        }
+
+        let source_stride = match sample_2d_stride {
+            Some(stride) => stride,
+            None => sample_stride(
+                self.source_width,
+                self.source_height,
+                self.source_stride,
+                current_len,
+            )?,
+        };
+        let required_len = frame_buffer_len(source_stride.bytes_per_row, self.source_height)?;
         if (current_len as usize) < required_len {
             bail!(
                 "Media Foundation returned a frame buffer that is too short; got {} bytes, need {required_len}",
@@ -240,26 +261,51 @@ impl VideoDecoder for MediaFoundationDecoder {
         let source = unsafe { std::slice::from_raw_parts(ptr, required_len) };
         let time = self.timestamp_clock.media_time_from_hns(timestamp_100ns)?;
 
-        match self.software_resize {
-            Some((width, height)) => resize_bgra(
+        let frame = match self.software_resize {
+            Some((width, height)) if source_stride.rows_are_top_down => resize_bgra(
                 source,
                 self.source_width,
                 self.source_height,
-                self.source_bytes_per_row,
+                source_stride.bytes_per_row,
                 width,
                 height,
                 time,
-            )
-            .map(Some),
-            None => VideoFrame::new_bgra(
+            ),
+            Some((width, height)) => {
+                let source = compact_bgra(
+                    source,
+                    self.source_width,
+                    self.source_height,
+                    source_stride,
+                    time,
+                )?;
+                resize_bgra(
+                    &source.data,
+                    source.width,
+                    source.height,
+                    source.bytes_per_row,
+                    width,
+                    height,
+                    time,
+                )
+            }
+            None if source_stride.rows_are_top_down => VideoFrame::new_bgra(
                 self.width,
                 self.height,
-                self.bytes_per_row,
+                source_stride.bytes_per_row,
                 time,
                 source.to_vec(),
-            )
-            .map(Some),
-        }
+            ),
+            None => compact_bgra(
+                source,
+                self.source_width,
+                self.source_height,
+                source_stride,
+                time,
+            ),
+        }?;
+
+        frame.rotated(self.display_rotation).map(Some)
     }
 
     fn duration(&self) -> Option<MediaTime> {
@@ -308,8 +354,185 @@ fn media_type_dimensions(media_type: &IMFMediaType) -> anyhow::Result<(u32, u32)
     Ok(((frame_size >> 32) as u32, (frame_size & 0xFFFF_FFFF) as u32))
 }
 
-fn media_type_stride(media_type: &IMFMediaType) -> Option<u32> {
-    unsafe { media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE).ok() }
+fn media_type_rotation(media_type: &IMFMediaType) -> anyhow::Result<Option<DisplayRotation>> {
+    let Ok(rotation) = (unsafe { media_type.GetUINT32(&MF_MT_VIDEO_ROTATION) }) else {
+        return Ok(None);
+    };
+
+    let rotation = DisplayRotation::from_clockwise_degrees(rotation as i32).with_context(|| {
+        format!("unsupported Media Foundation video rotation {rotation} degrees")
+    })?;
+    Ok((rotation != DisplayRotation::None).then_some(rotation))
+}
+
+fn media_type_stride(media_type: &IMFMediaType, width: u32) -> anyhow::Result<BgraSampleStride> {
+    let stride = match unsafe { media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE) } {
+        Ok(stride) => i32::from_ne_bytes(stride.to_ne_bytes()),
+        Err(_) => unsafe { MFGetStrideForBitmapInfoHeader(MFVideoFormat_RGB32.data1, width) }
+            .context("failed to get BGRA stride from Media Foundation")?,
+    };
+    bgra_sample_stride(stride, width)
+}
+
+fn sample_2d_stride(sample: &IMFSample, width: u32) -> anyhow::Result<Option<BgraSampleStride>> {
+    let Ok(buffer) = (unsafe { sample.GetBufferByIndex(0) }) else {
+        return Ok(None);
+    };
+    let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer>() else {
+        return Ok(None);
+    };
+
+    let mut scanline0 = std::ptr::null_mut();
+    let mut pitch = 0;
+    if unsafe { buffer_2d.GetScanline0AndPitch(&mut scanline0, &mut pitch) }.is_ok() && pitch != 0 {
+        return bgra_sample_stride(pitch, width).map(Some);
+    }
+
+    if let Ok(buffer_2d2) = buffer.cast::<IMF2DBuffer2>() {
+        let mut buffer_start = std::ptr::null_mut();
+        let mut buffer_len = 0;
+        if unsafe {
+            buffer_2d2.Lock2DSize(
+                MF2DBuffer_LockFlags_Read,
+                &mut scanline0,
+                &mut pitch,
+                &mut buffer_start,
+                &mut buffer_len,
+            )
+        }
+        .is_ok()
+        {
+            let _ = unsafe { buffer_2d2.Unlock2D() };
+            if pitch != 0 {
+                return bgra_sample_stride(pitch, width).map(Some);
+            }
+        }
+    }
+
+    if unsafe { buffer_2d.Lock2D(&mut scanline0, &mut pitch) }.is_ok() {
+        let _ = unsafe { buffer_2d.Unlock2D() };
+        if pitch != 0 {
+            return bgra_sample_stride(pitch, width).map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+fn bgra_sample_stride(stride: i32, width: u32) -> anyhow::Result<BgraSampleStride> {
+    if stride == i32::MIN {
+        bail!("Media Foundation returned an invalid BGRA stride");
+    }
+
+    let bytes_per_row = stride.unsigned_abs();
+    let min_bytes_per_row = width
+        .checked_mul(4)
+        .context("Media Foundation BGRA row width overflowed")?;
+    Ok(BgraSampleStride {
+        bytes_per_row: bytes_per_row.max(min_bytes_per_row),
+        rows_are_top_down: stride >= 0,
+    })
+}
+
+fn frame_buffer_len(bytes_per_row: u32, height: u32) -> anyhow::Result<usize> {
+    (bytes_per_row as usize)
+        .checked_mul(height as usize)
+        .context("Media Foundation frame buffer length overflowed")
+}
+
+fn sample_stride(
+    width: u32,
+    height: u32,
+    media_type_stride: BgraSampleStride,
+    buffer_len: u32,
+) -> anyhow::Result<BgraSampleStride> {
+    let min_bytes_per_row = width
+        .checked_mul(4)
+        .context("Media Foundation BGRA row width overflowed")?;
+    let reported_bytes_per_row = media_type_stride.bytes_per_row.max(min_bytes_per_row);
+    let reported_visible_len = reported_bytes_per_row as u64 * height as u64;
+
+    if buffer_len as u64 <= reported_visible_len {
+        return Ok(BgraSampleStride {
+            bytes_per_row: reported_bytes_per_row,
+            ..media_type_stride
+        });
+    }
+
+    if reported_bytes_per_row != 0 && buffer_len % reported_bytes_per_row == 0 {
+        return Ok(BgraSampleStride {
+            bytes_per_row: reported_bytes_per_row,
+            ..media_type_stride
+        });
+    }
+
+    // Some H.264 decoders expose visible width in MF_MT_DEFAULT_STRIDE while
+    // each sample is padded to coded width, e.g. 1080 BGRA pixels in a 1088-wide
+    // coded frame. In that case the buffer length reveals the actual row pitch.
+    if height != 0 && buffer_len % height == 0 {
+        let inferred_bytes_per_row = buffer_len / height;
+        if inferred_bytes_per_row >= reported_bytes_per_row && inferred_bytes_per_row % 4 == 0 {
+            return Ok(BgraSampleStride {
+                bytes_per_row: inferred_bytes_per_row,
+                ..media_type_stride
+            });
+        }
+    }
+
+    if let Some(inferred_bytes_per_row) =
+        infer_coded_surface_stride(width, height, reported_bytes_per_row, buffer_len)
+    {
+        return Ok(BgraSampleStride {
+            bytes_per_row: inferred_bytes_per_row,
+            ..media_type_stride
+        });
+    }
+
+    bail!(
+        "Media Foundation returned an ambiguous padded BGRA buffer; visible frame is {width}x{height}, reported stride is {reported_bytes_per_row}, buffer length is {buffer_len}"
+    )
+}
+
+fn infer_coded_surface_stride(
+    width: u32,
+    height: u32,
+    reported_bytes_per_row: u32,
+    buffer_len: u32,
+) -> Option<u32> {
+    let min_coded_width = width.max(reported_bytes_per_row / 4);
+    let max_bytes_per_row = buffer_len / height.max(1);
+
+    let mut bytes_per_row = reported_bytes_per_row;
+    while bytes_per_row <= max_bytes_per_row {
+        let coded_width = bytes_per_row / 4;
+        if bytes_per_row % 4 == 0
+            && coded_width >= min_coded_width
+            && buffer_len % bytes_per_row == 0
+        {
+            let coded_height = buffer_len / bytes_per_row;
+            if coded_height >= height {
+                return Some(bytes_per_row);
+            }
+        }
+        bytes_per_row = bytes_per_row.checked_add(4)?;
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BgraSampleStride {
+    bytes_per_row: u32,
+    rows_are_top_down: bool,
+}
+
+impl Default for BgraSampleStride {
+    fn default() -> Self {
+        Self {
+            bytes_per_row: 0,
+            rows_are_top_down: true,
+        }
+    }
 }
 
 fn media_duration(
@@ -356,6 +579,49 @@ fn resize_dimensions(width: u32, height: u32, max_dimension: Option<u32>) -> Opt
     }
 
     Some((resized_width.max(2), resized_height.max(2)))
+}
+
+fn compact_bgra(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    source_stride: BgraSampleStride,
+    time: MediaTime,
+) -> anyhow::Result<VideoFrame> {
+    let target_bytes_per_row = source_width
+        .checked_mul(4)
+        .context("compacted row width overflowed")?;
+    let mut data = vec![0_u8; target_bytes_per_row as usize * source_height as usize];
+    let row_len = target_bytes_per_row as usize;
+
+    for target_y in 0..source_height as usize {
+        let source_y = if source_stride.rows_are_top_down {
+            target_y
+        } else {
+            source_height as usize - 1 - target_y
+        };
+        let source_offset = source_y
+            .checked_mul(source_stride.bytes_per_row as usize)
+            .context("compacted source row offset overflowed")?;
+        let source_end = source_offset
+            .checked_add(row_len)
+            .context("compacted source row end overflowed")?;
+        let target_offset = target_y
+            .checked_mul(target_bytes_per_row as usize)
+            .context("compacted target row offset overflowed")?;
+        let source_row = source
+            .get(source_offset..source_end)
+            .context("compacted source row was out of bounds")?;
+        data[target_offset..target_offset + row_len].copy_from_slice(source_row);
+    }
+
+    VideoFrame::new_bgra(
+        source_width,
+        source_height,
+        target_bytes_per_row,
+        time,
+        data,
+    )
 }
 
 fn resize_bgra(
@@ -445,14 +711,78 @@ fn read_track_info(file: &mut File, trak_end: u64) -> anyhow::Result<Mp4TrackInf
     let mut track = Mp4TrackInfo::default();
 
     while let Some(box_header) = read_mp4_box(file, trak_end)? {
-        if box_header.kind == *b"mdia" {
-            track = read_media_info(file, box_header.end)?;
+        match &box_header.kind {
+            b"tkhd" => track.rotation = read_tkhd_rotation(file, box_header.end)?,
+            b"mdia" => {
+                let media = read_media_info(file, box_header.end)?;
+                track.handler_type = media.handler_type;
+                track.timescale = media.timescale;
+                track.mdhd_duration_units = media.mdhd_duration_units;
+                track.unknown_mdhd_duration_units = media.unknown_mdhd_duration_units;
+                track.stts_duration_units = media.stts_duration_units;
+            }
+            _ => {}
         }
         file.seek(SeekFrom::Start(box_header.end))
             .context("failed to skip MP4 track child box")?;
     }
 
     Ok(track)
+}
+
+fn read_tkhd_rotation(file: &mut File, box_end: u64) -> anyhow::Result<Option<DisplayRotation>> {
+    let payload_start = file
+        .stream_position()
+        .context("failed to read MP4 tkhd position")?;
+    let payload_len = box_end.saturating_sub(payload_start);
+    if payload_len == 0 {
+        bail!("MP4 tkhd box was empty");
+    }
+
+    let mut version = [0_u8; 1];
+    file.read_exact(&mut version)
+        .context("failed to read MP4 tkhd version")?;
+    let matrix_offset = match version[0] {
+        0 => 40_u64,
+        1 => 52_u64,
+        version => bail!("unsupported MP4 tkhd version {version}"),
+    };
+    let matrix_end = matrix_offset + 36;
+    if payload_len < matrix_end {
+        bail!("MP4 tkhd box was too short for display matrix");
+    }
+
+    file.seek(SeekFrom::Start(payload_start + matrix_offset))
+        .context("failed to seek to MP4 tkhd display matrix")?;
+    let mut matrix = [0_u8; 36];
+    file.read_exact(&mut matrix)
+        .context("failed to read MP4 tkhd display matrix")?;
+
+    Ok(rotation_from_mp4_matrix(
+        read_be_i32(&matrix[0..4]),
+        read_be_i32(&matrix[4..8]),
+        read_be_i32(&matrix[12..16]),
+        read_be_i32(&matrix[16..20]),
+    )
+    .ok())
+}
+
+fn rotation_from_mp4_matrix(a: i32, b: i32, c: i32, d: i32) -> anyhow::Result<DisplayRotation> {
+    const SCALE: i32 = 65_536;
+
+    if (a, b, c, d) == (SCALE, 0, 0, SCALE) {
+        Ok(DisplayRotation::None)
+    } else if (a, b, c, d) == (0, SCALE, -SCALE, 0) {
+        Ok(DisplayRotation::Clockwise90)
+    } else if (a, b, c, d) == (-SCALE, 0, 0, -SCALE) {
+        Ok(DisplayRotation::Clockwise180)
+    } else if (a, b, c, d) == (0, -SCALE, SCALE, 0) {
+        Ok(DisplayRotation::Clockwise270)
+    } else {
+        bail!(
+            "unsupported MP4 display matrix [{a}, {b}; {c}, {d}]; expected a right-angle rotation"
+        )
+    }
 }
 
 fn read_media_info(file: &mut File, mdia_end: u64) -> anyhow::Result<Mp4TrackInfo> {
@@ -655,6 +985,10 @@ fn read_be_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+fn read_be_i32(bytes: &[u8]) -> i32 {
+    i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
 fn read_be_u64(bytes: &[u8]) -> u64 {
     u64::from_be_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -672,6 +1006,7 @@ struct Mp4VideoTiming {
     timescale: Option<u32>,
     duration: Option<MediaTime>,
     unknown_mdhd_duration: Option<Mp4UnknownDuration>,
+    rotation: Option<DisplayRotation>,
 }
 
 impl Mp4VideoTiming {
@@ -709,6 +1044,7 @@ struct Mp4TrackInfo {
     mdhd_duration_units: Option<u64>,
     unknown_mdhd_duration_units: Option<u64>,
     stts_duration_units: Option<u64>,
+    rotation: Option<DisplayRotation>,
 }
 
 impl Mp4TrackInfo {
@@ -723,6 +1059,7 @@ impl Mp4TrackInfo {
                 self.unknown_mdhd_duration_units
                     .map(|units| Mp4UnknownDuration { units, timescale })
             }),
+            rotation: self.rotation,
         }
     }
 }
@@ -1179,5 +1516,145 @@ mod tests {
             value: 4_194_304_000_000,
             timescale: 10_000_000,
         }));
+    }
+
+    #[test]
+    fn bgra_sample_stride_preserves_negative_direction() {
+        let stride = bgra_sample_stride(-4320, 1080).unwrap();
+
+        assert_eq!(stride.bytes_per_row, 4320);
+        assert!(!stride.rows_are_top_down);
+    }
+
+    #[test]
+    fn mp4_display_matrix_rotation_matches_ffmpeg_convention() {
+        assert_eq!(
+            rotation_from_mp4_matrix(0, 65_536, -65_536, 0).unwrap(),
+            DisplayRotation::Clockwise90
+        );
+        assert_eq!(
+            rotation_from_mp4_matrix(0, -65_536, 65_536, 0).unwrap(),
+            DisplayRotation::Clockwise270
+        );
+    }
+
+    #[test]
+    fn mp4_display_matrix_rejects_skew() {
+        assert!(rotation_from_mp4_matrix(65_536, 1, 0, 65_536).is_err());
+    }
+
+    #[test]
+    fn tkhd_rotation_ignores_unsupported_display_matrix() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("segmenter_tkhd_hflip_{unique}.bin"));
+        let mut payload = vec![0_u8; 76];
+        payload[40..44].copy_from_slice(&(-65_536_i32).to_be_bytes());
+        payload[56..60].copy_from_slice(&65_536_i32.to_be_bytes());
+
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&payload).unwrap();
+        }
+
+        let mut file = File::open(&path).unwrap();
+        assert_eq!(read_tkhd_rotation(&mut file, 76).unwrap(), None);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sample_stride_uses_reported_stride_for_visible_buffer() {
+        assert_eq!(
+            sample_stride(1080, 1920, top_down_stride(4320), 4320 * 1920)
+                .unwrap()
+                .bytes_per_row,
+            4320
+        );
+    }
+
+    #[test]
+    fn sample_stride_infers_coded_width_padding() {
+        assert_eq!(
+            sample_stride(1080, 1920, top_down_stride(4320), 4352 * 1920)
+                .unwrap()
+                .bytes_per_row,
+            4352
+        );
+    }
+
+    #[test]
+    fn sample_stride_ignores_bottom_padding() {
+        assert_eq!(
+            sample_stride(1920, 1080, top_down_stride(7680), 7680 * 1088)
+                .unwrap()
+                .bytes_per_row,
+            7680
+        );
+    }
+
+    #[test]
+    fn sample_stride_prefers_whole_row_padding_over_width_inference() {
+        assert_eq!(
+            sample_stride(2000, 1000, top_down_stride(8000), 8000 * 1008)
+                .unwrap()
+                .bytes_per_row,
+            8000
+        );
+    }
+
+    #[test]
+    fn sample_stride_infers_coded_width_and_height_padding() {
+        assert_eq!(
+            sample_stride(108, 108, top_down_stride(432), 448 * 112)
+                .unwrap()
+                .bytes_per_row,
+            448
+        );
+    }
+
+    #[test]
+    fn sample_stride_rejects_ambiguous_padding() {
+        assert!(sample_stride(108, 108, top_down_stride(432), 432 * 108 + 2).is_err());
+    }
+
+    #[test]
+    fn sample_stride_enforces_minimum_bgra_row_width() {
+        assert_eq!(
+            sample_stride(1080, 1920, top_down_stride(0), 4320 * 1920)
+                .unwrap()
+                .bytes_per_row,
+            4320
+        );
+    }
+
+    #[test]
+    fn compact_bgra_flips_negative_stride_to_top_down() {
+        let source = vec![3, 0, 0, 255, 4, 0, 0, 255, 1, 0, 0, 255, 2, 0, 0, 255];
+        let frame = compact_bgra(
+            &source,
+            2,
+            2,
+            BgraSampleStride {
+                bytes_per_row: 8,
+                rows_are_top_down: false,
+            },
+            MediaTime::new(0, 1).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            frame.data,
+            vec![1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255]
+        );
+    }
+
+    fn top_down_stride(bytes_per_row: u32) -> BgraSampleStride {
+        BgraSampleStride {
+            bytes_per_row,
+            rows_are_top_down: true,
+        }
     }
 }

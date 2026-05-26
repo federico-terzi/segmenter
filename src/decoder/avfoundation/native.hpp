@@ -45,6 +45,7 @@ extern "C" void *segd_initialize_asset(const SEGDecodeOptions *options,
 extern "C" void segd_release_asset(void *asset);
 extern "C" uint32_t segd_get_asset_duration(void *asset,
                                             SEGDecodeTime *duration);
+extern "C" uint32_t segd_get_asset_rotation(void *asset, int32_t *rotation);
 
 extern "C" void *segd_initialize_asset_reader(const SEGDecodeOptions *options,
                                               void *asset,
