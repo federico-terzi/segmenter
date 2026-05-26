@@ -10,12 +10,12 @@ use windows::{
     Win32::{
         Media::MediaFoundation::{
             IMFAttributes, IMFMediaType, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
-            MFCreateSourceReaderFromURL, MFMediaType_Video, MFShutdown, MFStartup,
-            MFVideoFormat_RGB32, MFSTARTUP_NOSOCKET, MF_API_VERSION, MF_MT_DEFAULT_STRIDE,
-            MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
-            MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MF_SOURCE_READER_ALL_STREAMS,
-            MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-            MF_SOURCE_READER_MEDIASOURCE,
+            MFCreateSourceReaderFromURL, MFGetStrideForBitmapInfoHeader, MFMediaType_Video,
+            MFShutdown, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_NOSOCKET, MF_API_VERSION,
+            MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+            MF_PD_DURATION, MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR,
+            MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+            MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
         },
         System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
     },
@@ -136,8 +136,7 @@ impl MediaFoundationDecoder {
             }
         };
         let (source_width, source_height) = media_type_dimensions(&media_type)?;
-        let source_bytes_per_row =
-            media_type_stride(&media_type).unwrap_or(source_width.saturating_mul(4));
+        let source_bytes_per_row = media_type_stride(&media_type, source_width)?;
         let (width, height, bytes_per_row) = match software_resize {
             Some((width, height)) => (
                 width,
@@ -230,7 +229,17 @@ impl VideoDecoder for MediaFoundationDecoder {
             }
         }
 
-        let required_len = self.source_bytes_per_row as usize * self.source_height as usize;
+        if ptr.is_null() {
+            bail!("Media Foundation returned a null frame buffer");
+        }
+
+        let source_bytes_per_row = sample_bytes_per_row(
+            self.source_width,
+            self.source_height,
+            self.source_bytes_per_row,
+            current_len,
+        )?;
+        let required_len = frame_buffer_len(source_bytes_per_row, self.source_height)?;
         if (current_len as usize) < required_len {
             bail!(
                 "Media Foundation returned a frame buffer that is too short; got {} bytes, need {required_len}",
@@ -245,7 +254,7 @@ impl VideoDecoder for MediaFoundationDecoder {
                 source,
                 self.source_width,
                 self.source_height,
-                self.source_bytes_per_row,
+                source_bytes_per_row,
                 width,
                 height,
                 time,
@@ -254,7 +263,7 @@ impl VideoDecoder for MediaFoundationDecoder {
             None => VideoFrame::new_bgra(
                 self.width,
                 self.height,
-                self.bytes_per_row,
+                source_bytes_per_row,
                 time,
                 source.to_vec(),
             )
@@ -308,8 +317,60 @@ fn media_type_dimensions(media_type: &IMFMediaType) -> anyhow::Result<(u32, u32)
     Ok(((frame_size >> 32) as u32, (frame_size & 0xFFFF_FFFF) as u32))
 }
 
-fn media_type_stride(media_type: &IMFMediaType) -> Option<u32> {
-    unsafe { media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE).ok() }
+fn media_type_stride(media_type: &IMFMediaType, width: u32) -> anyhow::Result<u32> {
+    let stride = match unsafe { media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE) } {
+        Ok(stride) => i32::from_ne_bytes(stride.to_ne_bytes()),
+        Err(_) => unsafe { MFGetStrideForBitmapInfoHeader(MFVideoFormat_RGB32.data1, width) }
+            .context("failed to get BGRA stride from Media Foundation")?,
+    };
+    absolute_bgra_stride(stride, width)
+}
+
+fn absolute_bgra_stride(stride: i32, width: u32) -> anyhow::Result<u32> {
+    if stride == i32::MIN {
+        bail!("Media Foundation returned an invalid BGRA stride");
+    }
+
+    let bytes_per_row = stride.unsigned_abs();
+    let min_bytes_per_row = width
+        .checked_mul(4)
+        .context("Media Foundation BGRA row width overflowed")?;
+    Ok(bytes_per_row.max(min_bytes_per_row))
+}
+
+fn frame_buffer_len(bytes_per_row: u32, height: u32) -> anyhow::Result<usize> {
+    (bytes_per_row as usize)
+        .checked_mul(height as usize)
+        .context("Media Foundation frame buffer length overflowed")
+}
+
+fn sample_bytes_per_row(
+    width: u32,
+    height: u32,
+    media_type_bytes_per_row: u32,
+    buffer_len: u32,
+) -> anyhow::Result<u32> {
+    let min_bytes_per_row = width
+        .checked_mul(4)
+        .context("Media Foundation BGRA row width overflowed")?;
+    let reported_bytes_per_row = media_type_bytes_per_row.max(min_bytes_per_row);
+    let reported_visible_len = reported_bytes_per_row as u64 * height as u64;
+
+    if buffer_len as u64 <= reported_visible_len {
+        return Ok(reported_bytes_per_row);
+    }
+
+    // Some H.264 decoders expose visible width in MF_MT_DEFAULT_STRIDE while
+    // each sample is padded to coded width, e.g. 1080 BGRA pixels in a 1088-wide
+    // coded frame. In that case the buffer length reveals the actual row pitch.
+    if height != 0 && buffer_len % height == 0 {
+        let inferred_bytes_per_row = buffer_len / height;
+        if inferred_bytes_per_row >= reported_bytes_per_row && inferred_bytes_per_row % 4 == 0 {
+            return Ok(inferred_bytes_per_row);
+        }
+    }
+
+    Ok(reported_bytes_per_row)
 }
 
 fn media_duration(
@@ -1179,5 +1240,42 @@ mod tests {
             value: 4_194_304_000_000,
             timescale: 10_000_000,
         }));
+    }
+
+    #[test]
+    fn absolute_bgra_stride_accepts_signed_stride() {
+        assert_eq!(absolute_bgra_stride(-4320, 1080).unwrap(), 4320);
+    }
+
+    #[test]
+    fn sample_bytes_per_row_uses_reported_stride_for_visible_buffer() {
+        assert_eq!(
+            sample_bytes_per_row(1080, 1920, 4320, 4320 * 1920).unwrap(),
+            4320
+        );
+    }
+
+    #[test]
+    fn sample_bytes_per_row_infers_coded_width_padding() {
+        assert_eq!(
+            sample_bytes_per_row(1080, 1920, 4320, 4352 * 1920).unwrap(),
+            4352
+        );
+    }
+
+    #[test]
+    fn sample_bytes_per_row_ignores_bottom_padding() {
+        assert_eq!(
+            sample_bytes_per_row(1920, 1080, 7680, 7680 * 1088).unwrap(),
+            7680
+        );
+    }
+
+    #[test]
+    fn sample_bytes_per_row_enforces_minimum_bgra_row_width() {
+        assert_eq!(
+            sample_bytes_per_row(1080, 1920, 0, 4320 * 1920).unwrap(),
+            4320
+        );
     }
 }
