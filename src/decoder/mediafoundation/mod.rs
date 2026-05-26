@@ -6,10 +6,11 @@ use std::{
 
 use anyhow::{bail, Context};
 use windows::{
-    core::{GUID, PWSTR},
+    core::{Interface, GUID, PWSTR},
     Win32::{
         Media::MediaFoundation::{
-            IMFAttributes, IMFMediaType, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
+            IMF2DBuffer, IMF2DBuffer2, IMFAttributes, IMFMediaType, IMFSample, IMFSourceReader,
+            MF2DBuffer_LockFlags_Read, MFCreateAttributes, MFCreateMediaType,
             MFCreateSourceReaderFromURL, MFGetStrideForBitmapInfoHeader, MFMediaType_Video,
             MFShutdown, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_NOSOCKET, MF_API_VERSION,
             MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
@@ -219,6 +220,7 @@ impl VideoDecoder for MediaFoundationDecoder {
             return Ok(None);
         };
 
+        let sample_2d_stride = sample_2d_stride(&sample, self.source_width)?;
         let buffer = unsafe { sample.ConvertToContiguousBuffer() }
             .context("failed to convert Media Foundation sample to a contiguous buffer")?;
 
@@ -240,12 +242,15 @@ impl VideoDecoder for MediaFoundationDecoder {
             bail!("Media Foundation returned a null frame buffer");
         }
 
-        let source_stride = sample_stride(
-            self.source_width,
-            self.source_height,
-            self.source_stride,
-            current_len,
-        )?;
+        let source_stride = match sample_2d_stride {
+            Some(stride) => stride,
+            None => sample_stride(
+                self.source_width,
+                self.source_height,
+                self.source_stride,
+                current_len,
+            )?,
+        };
         let required_len = frame_buffer_len(source_stride.bytes_per_row, self.source_height)?;
         if (current_len as usize) < required_len {
             bail!(
@@ -369,6 +374,51 @@ fn media_type_stride(media_type: &IMFMediaType, width: u32) -> anyhow::Result<Bg
     bgra_sample_stride(stride, width)
 }
 
+fn sample_2d_stride(sample: &IMFSample, width: u32) -> anyhow::Result<Option<BgraSampleStride>> {
+    let Ok(buffer) = (unsafe { sample.GetBufferByIndex(0) }) else {
+        return Ok(None);
+    };
+    let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer>() else {
+        return Ok(None);
+    };
+
+    let mut scanline0 = std::ptr::null_mut();
+    let mut pitch = 0;
+    if unsafe { buffer_2d.GetScanline0AndPitch(&mut scanline0, &mut pitch) }.is_ok() && pitch != 0 {
+        return bgra_sample_stride(pitch, width).map(Some);
+    }
+
+    if let Ok(buffer_2d2) = buffer.cast::<IMF2DBuffer2>() {
+        let mut buffer_start = std::ptr::null_mut();
+        let mut buffer_len = 0;
+        if unsafe {
+            buffer_2d2.Lock2DSize(
+                MF2DBuffer_LockFlags_Read,
+                &mut scanline0,
+                &mut pitch,
+                &mut buffer_start,
+                &mut buffer_len,
+            )
+        }
+        .is_ok()
+        {
+            let _ = unsafe { buffer_2d2.Unlock2D() };
+            if pitch != 0 {
+                return bgra_sample_stride(pitch, width).map(Some);
+            }
+        }
+    }
+
+    if unsafe { buffer_2d.Lock2D(&mut scanline0, &mut pitch) }.is_ok() {
+        let _ = unsafe { buffer_2d.Unlock2D() };
+        if pitch != 0 {
+            return bgra_sample_stride(pitch, width).map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
 fn bgra_sample_stride(stride: i32, width: u32) -> anyhow::Result<BgraSampleStride> {
     if stride == i32::MIN {
         bail!("Media Foundation returned an invalid BGRA stride");
@@ -429,10 +479,45 @@ fn sample_stride(
         }
     }
 
-    Ok(BgraSampleStride {
-        bytes_per_row: reported_bytes_per_row,
-        ..media_type_stride
-    })
+    if let Some(inferred_bytes_per_row) =
+        infer_coded_surface_stride(width, height, reported_bytes_per_row, buffer_len)
+    {
+        return Ok(BgraSampleStride {
+            bytes_per_row: inferred_bytes_per_row,
+            ..media_type_stride
+        });
+    }
+
+    bail!(
+        "Media Foundation returned an ambiguous padded BGRA buffer; visible frame is {width}x{height}, reported stride is {reported_bytes_per_row}, buffer length is {buffer_len}"
+    )
+}
+
+fn infer_coded_surface_stride(
+    width: u32,
+    height: u32,
+    reported_bytes_per_row: u32,
+    buffer_len: u32,
+) -> Option<u32> {
+    let min_coded_width = width.max(reported_bytes_per_row / 4);
+    let max_bytes_per_row = buffer_len / height.max(1);
+
+    let mut bytes_per_row = reported_bytes_per_row;
+    while bytes_per_row <= max_bytes_per_row {
+        let coded_width = bytes_per_row / 4;
+        if bytes_per_row % 4 == 0
+            && coded_width >= min_coded_width
+            && buffer_len % bytes_per_row == 0
+        {
+            let coded_height = buffer_len / bytes_per_row;
+            if coded_height >= height {
+                return Some(bytes_per_row);
+            }
+        }
+        bytes_per_row = bytes_per_row.checked_add(4)?;
+    }
+
+    None
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1518,6 +1603,21 @@ mod tests {
                 .bytes_per_row,
             8000
         );
+    }
+
+    #[test]
+    fn sample_stride_infers_coded_width_and_height_padding() {
+        assert_eq!(
+            sample_stride(108, 108, top_down_stride(432), 448 * 112)
+                .unwrap()
+                .bytes_per_row,
+            448
+        );
+    }
+
+    #[test]
+    fn sample_stride_rejects_ambiguous_padding() {
+        assert!(sample_stride(108, 108, top_down_stride(432), 432 * 108 + 2).is_err());
     }
 
     #[test]
