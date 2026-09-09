@@ -31,7 +31,7 @@ use windows::{
 
 use crate::{
     encoder::VideoEncoder,
-    frame::{MediaTime, PixelFormat, VideoFrame},
+    frame::{validate_bgra_buffer, MediaTime, PixelFormat, VideoFrame},
 };
 
 const DEFAULT_FINAL_FRAME_DURATION_HNS: i64 = 10_000_000 / 30;
@@ -177,8 +177,7 @@ impl MediaFoundationEncoder {
             .video_encoder
             .as_ref()
             .context("Media Foundation H.264 encoder was not initialized")?;
-        let nv12 = bgra_to_nv12(&pending, self.width, self.height)?;
-        let sample = create_sample(&nv12, pending.time_hns, duration_hns)?;
+        let sample = create_sample(&pending.nv12, pending.time_hns, duration_hns)?;
 
         unsafe {
             video_encoder
@@ -385,9 +384,8 @@ impl VideoEncoder for MediaFoundationEncoder {
         }
 
         self.pending_frame = Some(PendingFrame {
-            data: frame.data.clone(),
+            nv12: bgra_to_nv12(frame)?,
             time_hns: current_time_hns,
-            bytes_per_row: frame.bytes_per_row,
         });
         Ok(())
     }
@@ -432,9 +430,9 @@ impl VideoEncoder for MediaFoundationEncoder {
 unsafe impl Send for MediaFoundationEncoder {}
 
 struct PendingFrame {
-    data: Vec<u8>,
+    // Retain the smaller encoder-ready NV12 buffer while waiting for the next PTS.
+    nv12: Vec<u8>,
     time_hns: i64,
-    bytes_per_row: u32,
 }
 
 struct SampleTiming {
@@ -691,15 +689,51 @@ fn take_output_events(
     unsafe { ManuallyDrop::take(&mut output_buffer.pEvents) }
 }
 
-fn bgra_to_nv12(frame: &PendingFrame, width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
-    let width = width as usize;
-    let height = height as usize;
+fn bgra_to_nv12(frame: &VideoFrame) -> anyhow::Result<Vec<u8>> {
+    validate_bgra_buffer(
+        frame.width,
+        frame.height,
+        frame.bytes_per_row,
+        frame.data.len(),
+    )?;
+    if frame.width % 2 != 0 || frame.height % 2 != 0 {
+        bail!("NV12 requires even frame dimensions");
+    }
+    let width = frame.width as usize;
+    let height = frame.height as usize;
     let bytes_per_row = frame.bytes_per_row as usize;
     let y_plane_len = width
         .checked_mul(height)
         .context("NV12 luma plane size overflowed")?;
     let uv_plane_len = y_plane_len / 2;
     let mut nv12 = vec![0_u8; y_plane_len + uv_plane_len];
+
+    // RVM masks are grayscale. The existing limited-range RGB formula reduces
+    // exactly to Y = ((220 * gray + 128) >> 8) + 16 and neutral UV = 128.
+    // Check the channels so this encoder still handles arbitrary BGRA callers.
+    let grayscale = frame
+        .data
+        .chunks_exact(bytes_per_row)
+        .take(height)
+        .all(|row| {
+            row[..width * 4]
+                .chunks_exact(4)
+                .all(|p| p[0] == p[1] && p[1] == p[2])
+        });
+    if grayscale {
+        for (row, luma) in frame
+            .data
+            .chunks_exact(bytes_per_row)
+            .take(height)
+            .zip(nv12[..y_plane_len].chunks_exact_mut(width))
+        {
+            for (pixel, y) in row[..width * 4].chunks_exact(4).zip(luma) {
+                *y = (((220 * pixel[0] as u32 + 128) >> 8) + 16) as u8;
+            }
+        }
+        nv12[y_plane_len..].fill(128);
+        return Ok(nv12);
+    }
 
     for y in 0..height {
         for x in 0..width {
@@ -732,7 +766,7 @@ fn bgra_to_nv12(frame: &PendingFrame, width: u32, height: u32) -> anyhow::Result
 }
 
 fn bgra_pixel(
-    frame: &PendingFrame,
+    frame: &VideoFrame,
     x: usize,
     y: usize,
     bytes_per_row: usize,
@@ -802,4 +836,45 @@ unsafe fn mf_set_attribute_ratio(
     denominator: u32,
 ) -> windows::core::Result<()> {
     attributes.SetUINT64(key, ((numerator as u64) << 32) | denominator as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grayscale_nv12_matches_rgb_formula_for_all_256_levels_and_padded_rows() {
+        let mut data = vec![77; 2 * 1032];
+        for y in 0..2 {
+            for x in 0..256 {
+                data[y * 1032 + x * 4..y * 1032 + x * 4 + 4]
+                    .copy_from_slice(&[x as u8, x as u8, x as u8, 255]);
+            }
+        }
+        let frame =
+            VideoFrame::new_bgra(256, 2, 1032, MediaTime::new(0, 1).unwrap(), data).unwrap();
+        let nv12 = bgra_to_nv12(&frame).unwrap();
+        for (i, &value) in nv12[..512].iter().enumerate() {
+            let gray = (i % 256) as u8;
+            assert_eq!(value, rgb_to_yuv_limited(gray, gray, gray).0);
+        }
+        assert!(nv12[512..].iter().all(|&v| v == 128));
+    }
+
+    #[test]
+    fn colored_nv12_preserves_chroma_and_rejects_invalid_layouts() {
+        // Blue, green, red, white, each with a different alpha (ignored).
+        let data = vec![
+            255, 0, 0, 0, 0, 255, 0, 7, 0, 0, 255, 99, 255, 255, 255, 255,
+        ];
+        let mut frame = VideoFrame::new_bgra(2, 2, 8, MediaTime::new(0, 1).unwrap(), data).unwrap();
+        assert_eq!(
+            bgra_to_nv12(&frame).unwrap(),
+            vec![41, 144, 82, 235, 128, 128]
+        );
+        frame.data.truncate(4);
+        assert!(bgra_to_nv12(&frame).is_err());
+        let odd = VideoFrame::new_bgra(1, 2, 4, frame.time, vec![0; 8]).unwrap();
+        assert!(bgra_to_nv12(&odd).is_err());
+    }
 }

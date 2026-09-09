@@ -8,13 +8,12 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{bail, Context};
 use half::f16;
-use ndarray::Array1;
-use ort::{inputs, value::TensorRef};
+use ort::value::Tensor;
 
 use self::{
     constants::{
-        DOWNSAMPLE_RATIO_INPUT, PHA_OUTPUT, R1_INPUT, R2_INPUT, R3_INPUT, R4_INPUT,
-        RESIZE_IDENTITY_NODE_NAME, SRC_INPUT,
+        DOWNSAMPLE_RATIO_INPUT, PHA_OUTPUT, R1_INPUT, R1_OUTPUT, R2_INPUT, R2_OUTPUT, R3_INPUT,
+        R3_OUTPUT, R4_INPUT, R4_OUTPUT, RESIZE_IDENTITY_NODE_NAME, SRC_INPUT,
     },
     model_patch::{
         prepare_identity_retry_model, prepare_primary_model, should_patch_identity_resize,
@@ -34,7 +33,7 @@ pub struct OnnxEngine {
     model_path: PathBuf,
     state: Option<OnnxSessionState>,
     requested_downsample_ratio: f32,
-    downsample_ratio: Array1<f32>,
+    downsample_ratio: Tensor<f32>,
 }
 
 impl OnnxEngine {
@@ -59,7 +58,7 @@ impl OnnxEngine {
             model_path,
             state: None,
             requested_downsample_ratio: downsample_ratio,
-            downsample_ratio: Array1::from_vec(vec![effective_downsample_ratio]),
+            downsample_ratio: Tensor::from_array(([1], vec![effective_downsample_ratio]))?,
         })
     }
 
@@ -92,7 +91,8 @@ impl OnnxEngine {
             self.requested_downsample_ratio,
         )?;
         log_messages(&prepared.messages);
-        self.downsample_ratio = Array1::from_vec(vec![prepared.effective_downsample_ratio]);
+        self.downsample_ratio =
+            Tensor::from_array(([1], vec![prepared.effective_downsample_ratio]))?;
 
         let state = match self.build_prepared_session(&prepared, width, height) {
             Ok(state) => state,
@@ -118,7 +118,8 @@ impl OnnxEngine {
                     }
                 };
                 log_messages(&retry.messages);
-                self.downsample_ratio = Array1::from_vec(vec![retry.effective_downsample_ratio]);
+                self.downsample_ratio =
+                    Tensor::from_array(([1], vec![retry.effective_downsample_ratio]))?;
                 self.build_prepared_session(&retry, width, height)
                     .with_context(|| "identity-patch retry with dynamic src dimensions failed")?
             }
@@ -157,57 +158,44 @@ impl Engine for OnnxEngine {
         }
         self.ensure_initialized(frame.width, frame.height)?;
 
-        let downsample_ratio = self.downsample_ratio.view();
         let state = self
             .state
             .as_mut()
             .context("RVM ONNX session was not initialized")?;
         let precision = state.precision;
 
-        let mut outputs = match precision {
+        // BindInput may copy CPU data immediately. Clear the old bindings before
+        // filling the reusable tensor, then rebind it on every frame.
+        state.binding.clear_inputs();
+        match precision {
             RvmPrecision::Float16 => {
-                let src = preprocess_f16(frame)?;
-                if state.uses_downsample_ratio {
-                    state.session.run(inputs![
-                        SRC_INPUT => TensorRef::from_array_view(src.view())?,
-                        R1_INPUT => &state.recurrent[0],
-                        R2_INPUT => &state.recurrent[1],
-                        R3_INPUT => &state.recurrent[2],
-                        R4_INPUT => &state.recurrent[3],
-                        DOWNSAMPLE_RATIO_INPUT => TensorRef::from_array_view(downsample_ratio)?,
-                    ])?
-                } else {
-                    state.session.run(inputs![
-                        SRC_INPUT => TensorRef::from_array_view(src.view())?,
-                        R1_INPUT => &state.recurrent[0],
-                        R2_INPUT => &state.recurrent[1],
-                        R3_INPUT => &state.recurrent[2],
-                        R4_INPUT => &state.recurrent[3],
-                    ])?
-                }
+                preprocess_f16(frame, state.src.try_extract_tensor_mut::<f16>()?.1)?;
             }
             RvmPrecision::Float32 => {
-                let src = preprocess_f32(frame)?;
-                if state.uses_downsample_ratio {
-                    state.session.run(inputs![
-                        SRC_INPUT => TensorRef::from_array_view(src.view())?,
-                        R1_INPUT => &state.recurrent[0],
-                        R2_INPUT => &state.recurrent[1],
-                        R3_INPUT => &state.recurrent[2],
-                        R4_INPUT => &state.recurrent[3],
-                        DOWNSAMPLE_RATIO_INPUT => TensorRef::from_array_view(downsample_ratio)?,
-                    ])?
-                } else {
-                    state.session.run(inputs![
-                        SRC_INPUT => TensorRef::from_array_view(src.view())?,
-                        R1_INPUT => &state.recurrent[0],
-                        R2_INPUT => &state.recurrent[1],
-                        R3_INPUT => &state.recurrent[2],
-                        R4_INPUT => &state.recurrent[3],
-                    ])?
-                }
+                preprocess_f32(frame, state.src.try_extract_tensor_mut::<f32>()?.1)?;
             }
-        };
+        }
+        // ORT retains allocated bound outputs across runs. Reset the recurrent
+        // destinations while the previous states remain alive: a state must
+        // never be both an input and an output of the same inference.
+        for name in [R1_OUTPUT, R2_OUTPUT, R3_OUTPUT, R4_OUTPUT] {
+            state
+                .binding
+                .bind_output_to_device(name, &state.recurrent_memory)?;
+        }
+        state.binding.bind_input(SRC_INPUT, &state.src)?;
+        for (name, recurrent) in [R1_INPUT, R2_INPUT, R3_INPUT, R4_INPUT]
+            .into_iter()
+            .zip(&state.recurrent)
+        {
+            state.binding.bind_input(name, recurrent)?;
+        }
+        if state.uses_downsample_ratio {
+            state
+                .binding
+                .bind_input(DOWNSAMPLE_RATIO_INPUT, &self.downsample_ratio)?;
+        }
+        let mut outputs = state.session.run_binding(&state.binding)?;
 
         let mask = match precision {
             RvmPrecision::Float16 => {
@@ -236,7 +224,16 @@ impl Engine for OnnxEngine {
             }
         };
 
-        state.recurrent = take_recurrent_outputs(&mut outputs)?;
+        let recurrent = take_recurrent_outputs(&mut outputs)?;
+        #[cfg(test)]
+        for (previous, next) in state.recurrent.iter().zip(&recurrent) {
+            assert_ne!(
+                previous.data_ptr(),
+                next.data_ptr(),
+                "recurrent input and output allocations must not alias"
+            );
+        }
+        state.recurrent = recurrent;
         Ok(mask)
     }
 }

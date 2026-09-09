@@ -4,8 +4,12 @@ use anyhow::{bail, Context};
 use half::f16;
 #[cfg(target_os = "windows")]
 use ort::execution_providers::DirectMLExecutionProvider;
+#[cfg(target_os = "windows")]
+use ort::memory::Allocator;
 use ort::{
     execution_providers::{CPUExecutionProvider, ExecutionProviderDispatch},
+    io_binding::IoBinding,
+    memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
     session::{builder::GraphOptimizationLevel, Session},
     tensor::TensorElementType,
     value::{DynTensor, DynTensorValueType, Tensor, ValueType},
@@ -25,6 +29,9 @@ pub(super) struct OnnxSessionState {
     pub(super) session: Session,
     pub(super) precision: RvmPrecision,
     pub(super) recurrent: Vec<DynTensor>,
+    pub(super) src: DynTensor,
+    pub(super) binding: IoBinding,
+    pub(super) recurrent_memory: MemoryInfo,
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) uses_downsample_ratio: bool,
@@ -42,6 +49,8 @@ pub(super) fn build_session_state(
         .with_execution_providers(execution_providers())?
         .with_parallel_execution(false)?
         .with_memory_pattern(false)?;
+    #[cfg(target_os = "windows")]
+    let builder = builder.with_intra_op_spinning(false)?;
 
     let session = match source {
         ModelSource::File(path) => builder.commit_from_file(path),
@@ -52,15 +61,69 @@ pub(super) fn build_session_state(
     validate_io_names(&session, uses_downsample_ratio)?;
     let precision = model_precision(&session)?;
     let recurrent = initial_recurrent_states(precision)?;
+    let shape = [1, 3, height as usize, width as usize];
+    let len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|v| v.checked_mul(3))
+        .context("RVM input tensor size overflowed")?;
+    let src = match precision {
+        RvmPrecision::Float16 => Tensor::from_array((shape, vec![f16::ZERO; len]))?.upcast(),
+        RvmPrecision::Float32 => Tensor::from_array((shape, vec![0.0_f32; len]))?.upcast(),
+    };
+    let mut binding = session.create_binding()?;
+    let cpu_memory = MemoryInfo::new(
+        AllocationDevice::CPU,
+        0,
+        AllocatorType::Device,
+        MemoryType::Default,
+    )?;
+    binding.bind_output_to_device(PHA_OUTPUT, &cpu_memory)?;
+    let recurrent_memory = recurrent_memory(&session)?;
+    for name in [R1_OUTPUT, R2_OUTPUT, R3_OUTPUT, R4_OUTPUT] {
+        binding.bind_output_to_device(name, &recurrent_memory)?;
+    }
 
     Ok(OnnxSessionState {
         session,
         precision,
         recurrent,
+        src,
+        binding,
+        recurrent_memory,
         width,
         height,
         uses_downsample_ratio,
     })
+}
+
+fn recurrent_memory(session: &Session) -> anyhow::Result<MemoryInfo> {
+    #[cfg(target_os = "windows")]
+    {
+        let memory = MemoryInfo::new(
+            AllocationDevice::DIRECTML,
+            0,
+            AllocatorType::Device,
+            MemoryType::Default,
+        )?;
+        // Registration can fall back to CPU. Only request DML outputs when the
+        // session actually has a DML allocator; never extract these on the CPU.
+        if Allocator::new(session, memory).is_ok() {
+            eprintln!("INFO: Keeping ONNX recurrent state in DirectML memory");
+            return Ok(MemoryInfo::new(
+                AllocationDevice::DIRECTML,
+                0,
+                AllocatorType::Device,
+                MemoryType::Default,
+            )?);
+        }
+    }
+    let _ = session;
+    Ok(MemoryInfo::new(
+        AllocationDevice::CPU,
+        0,
+        AllocatorType::Device,
+        MemoryType::Default,
+    )?)
 }
 
 pub(super) fn take_recurrent_outputs(

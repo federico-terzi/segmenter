@@ -14,8 +14,8 @@ use windows::{
             MFCreateSourceReaderFromURL, MFGetStrideForBitmapInfoHeader, MFMediaType_Video,
             MFShutdown, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_NOSOCKET, MF_API_VERSION,
             MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-            MF_MT_VIDEO_ROTATION, MF_PD_DURATION, MF_SOURCE_READERF_ENDOFSTREAM,
-            MF_SOURCE_READERF_ERROR, MF_SOURCE_READER_ALL_STREAMS,
+            MF_MT_VIDEO_ROTATION, MF_PD_DURATION, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
+            MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MF_SOURCE_READER_ALL_STREAMS,
             MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
             MF_SOURCE_READER_MEDIASOURCE,
         },
@@ -25,12 +25,23 @@ use windows::{
 
 use crate::{
     decoder::{DecodeOptions, VideoDecoder},
-    frame::{DisplayRotation, MediaTime, VideoFrame},
+    frame::{validate_bgra_buffer, DisplayRotation, MediaTime, VideoFrame},
 };
 
+mod nv12;
+
+struct PendingSample {
+    sample: IMFSample,
+    timestamp: i64,
+}
+
 pub struct MediaFoundationDecoder {
+    nv12: Option<nv12::Layout>,
+    pending_sample: Option<PendingSample>,
     source_reader: Option<IMFSourceReader>,
     input: PathBuf,
+    options: DecodeOptions,
+    delivered_frames: u64,
     width: u32,
     height: u32,
     bytes_per_row: u32,
@@ -47,6 +58,14 @@ pub struct MediaFoundationDecoder {
 
 impl MediaFoundationDecoder {
     pub fn new(input: &Path, options: DecodeOptions) -> anyhow::Result<Self> {
+        Self::new_with_nv12(input, options, true)
+    }
+
+    fn new_with_nv12(
+        input: &Path,
+        options: DecodeOptions,
+        prefer_nv12: bool,
+    ) -> anyhow::Result<Self> {
         if !input.exists() {
             bail!("input file does not exist: {}", input.display());
         }
@@ -57,8 +76,12 @@ impl MediaFoundationDecoder {
             .ok()
             .context("failed to initialize COM for Media Foundation")?;
         let mut decoder = Self {
+            nv12: None,
+            pending_sample: None,
             source_reader: None,
             input: input.to_path_buf(),
+            options,
+            delivered_frames: 0,
             width: 0,
             height: 0,
             bytes_per_row: 0,
@@ -73,8 +96,17 @@ impl MediaFoundationDecoder {
             mf_started: false,
         };
 
-        let result = decoder.initialize(input, options, mp4_timing);
-        result.map(|_| decoder)
+        if let Err(error) = decoder.initialize(input, options, mp4_timing, prefer_nv12) {
+            if !prefer_nv12 {
+                return Err(error);
+            }
+            eprintln!("INFO: Using Media Foundation RGB conversion: {error:#}");
+            decoder.pending_sample = None;
+            decoder.nv12 = None;
+            decoder.source_reader = None;
+            decoder.initialize(input, options, mp4_timing, false)?;
+        }
+        Ok(decoder)
     }
 
     fn initialize(
@@ -82,10 +114,13 @@ impl MediaFoundationDecoder {
         input: &Path,
         options: DecodeOptions,
         mp4_timing: Mp4VideoTiming,
+        prefer_nv12: bool,
     ) -> anyhow::Result<()> {
-        unsafe { MFStartup(MF_API_VERSION, MFSTARTUP_NOSOCKET) }
-            .context("failed to initialize Media Foundation")?;
-        self.mf_started = true;
+        if !self.mf_started {
+            unsafe { MFStartup(MF_API_VERSION, MFSTARTUP_NOSOCKET) }
+                .context("failed to initialize Media Foundation")?;
+            self.mf_started = true;
+        }
 
         let mut path_wide: Vec<u16> = input.to_string_lossy().encode_utf16().collect();
         path_wide.push(0);
@@ -127,6 +162,30 @@ impl MediaFoundationDecoder {
             .or(mp4_timing.rotation)
             .unwrap_or(DisplayRotation::None);
         let target_size = resize_dimensions(original_width, original_height, options.max_dimension);
+        // Keep an existing decoder-provided RGB resize if negotiation accepts
+        // it: its filter need not equal our software bilinear interpolation.
+        if prefer_nv12
+            && (target_size.is_none() || configure_bgra_format(source_reader, target_size).is_err())
+        {
+            let (layout, first) = nv12::configure(source_reader, original_width, original_height)?;
+            let (width, height) = target_size.unwrap_or((original_width, original_height));
+            self.nv12 = Some(layout);
+            self.pending_sample = Some(first);
+            self.width = width;
+            self.height = height;
+            self.source_width = original_width;
+            self.source_height = original_height;
+            self.bytes_per_row = width
+                .checked_mul(4)
+                .context("NV12 output row width overflowed")?;
+            self.display_rotation = display_rotation;
+            self.verify_nv12_first_frame(input, mp4_timing)?;
+            eprintln!(
+                "INFO: Using native NV12 decoding with exact {:?} conversion",
+                layout.matrix
+            );
+            return Ok(());
+        }
         let (media_type, software_resize) = match configure_bgra_format(source_reader, target_size)
         {
             Ok(media_type) => (media_type, None),
@@ -165,10 +224,78 @@ impl MediaFoundationDecoder {
         self.display_rotation = display_rotation;
         Ok(())
     }
+
+    fn reopen_rgb(&mut self) -> anyhow::Result<()> {
+        self.pending_sample = None;
+        self.nv12 = None;
+        self.source_reader = None;
+        let input = self.input.clone();
+        let timing = mp4_video_timing(&input).unwrap_or_default();
+        self.timestamp_clock = TimestampClock::new(timing.timescale);
+        self.initialize(&input, self.options, timing, false)?;
+        // A rare midstream format/interlace change must not drop or reorder
+        // frames. Replaying through the original decoder also restores its
+        // timestamp clock. This path is deliberately slow but conservative.
+        for _ in 0..self.delivered_frames {
+            self.read_frame_inner()?
+                .context("RGB fallback ended before the current frame")?;
+        }
+        Ok(())
+    }
+
+    fn verify_nv12_first_frame(&self, input: &Path, timing: Mp4VideoTiming) -> anyhow::Result<()> {
+        let pending = self
+            .pending_sample
+            .as_ref()
+            .context("missing first native sample")?;
+        let layout = self.nv12.context("missing native layout")?;
+        let time = TimestampClock::new(timing.timescale).media_time_from_hns(pending.timestamp)?;
+        with_sample_buffer(&pending.sample, |source| {
+            let convert = |matrix| {
+                nv12::to_bgra(
+                    source,
+                    nv12::Layout { matrix, ..layout },
+                    layout.width,
+                    layout.height,
+                    time,
+                )?
+                .rotated(self.display_rotation)
+            };
+            let actual = convert(layout.matrix)?;
+            let mut reference = Self::new_with_nv12(
+                input,
+                DecodeOptions {
+                    max_dimension: None,
+                },
+                false,
+            )?;
+            let expected = reference
+                .read_frame_inner()?
+                .context("RGB decoder returned no first frame")?;
+            // Verify actual processor behavior instead of guessing its matrix
+            // from resolution or trusting metadata it may ignore.
+            anyhow::ensure!(
+                nv12::same_rgb_frame(&actual, &expected),
+                "native color conversion differs from the RGB processor"
+            );
+            let other_matrix = match layout.matrix {
+                nv12::Matrix::Bt601 => nv12::Matrix::Bt709,
+                nv12::Matrix::Bt709 => nv12::Matrix::Bt601,
+            };
+            // Neutral frames match both matrices and cannot establish how
+            // the processor will convert colors in subsequent frames.
+            anyhow::ensure!(
+                !nv12::same_rgb_frame(&convert(other_matrix)?, &expected),
+                "first frame cannot distinguish the RGB processor's color matrix"
+            );
+            Ok(())
+        })
+    }
 }
 
 impl Drop for MediaFoundationDecoder {
     fn drop(&mut self) {
+        self.pending_sample = None;
         self.source_reader = None;
         unsafe {
             if self.mf_started {
@@ -183,6 +310,28 @@ impl Drop for MediaFoundationDecoder {
 
 impl VideoDecoder for MediaFoundationDecoder {
     fn read_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
+        let result = self.read_frame_inner();
+        let frame = match result {
+            Err(error) if self.nv12.is_some() => {
+                eprintln!("INFO: Returning to Media Foundation RGB conversion: {error:#}");
+                self.reopen_rgb()?;
+                self.read_frame_inner()?
+            }
+            result => result?,
+        };
+        if frame.is_some() {
+            self.delivered_frames += 1;
+        }
+        Ok(frame)
+    }
+
+    fn duration(&self) -> Option<MediaTime> {
+        self.duration
+    }
+}
+
+impl MediaFoundationDecoder {
+    fn read_frame_inner(&mut self) -> anyhow::Result<Option<VideoFrame>> {
         let mut stream_flags = 0;
         let mut timestamp_100ns = 0;
         let mut sample = None;
@@ -191,22 +340,27 @@ impl VideoDecoder for MediaFoundationDecoder {
             .as_ref()
             .context("Media Foundation source reader was not initialized")?;
 
-        unsafe {
-            source_reader
-                .ReadSample(
-                    MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
-                    0,
-                    None,
-                    Some(&mut stream_flags),
-                    Some(&mut timestamp_100ns),
-                    Some(&mut sample),
-                )
-                .with_context(|| {
-                    format!(
-                        "failed to read Media Foundation sample from {}",
-                        self.input.display()
+        if let Some(pending) = self.pending_sample.take() {
+            timestamp_100ns = pending.timestamp;
+            sample = Some(pending.sample);
+        } else {
+            unsafe {
+                source_reader
+                    .ReadSample(
+                        MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                        0,
+                        None,
+                        Some(&mut stream_flags),
+                        Some(&mut timestamp_100ns),
+                        Some(&mut sample),
                     )
-                })?;
+                    .with_context(|| {
+                        format!(
+                            "failed to read Media Foundation sample from {}",
+                            self.input.display()
+                        )
+                    })?;
+            }
         }
 
         if stream_flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
@@ -219,103 +373,128 @@ impl VideoDecoder for MediaFoundationDecoder {
         let Some(sample) = sample else {
             return Ok(None);
         };
-
-        let sample_2d_stride = sample_2d_stride(&sample, self.source_width)?;
-        let buffer = unsafe { sample.ConvertToContiguousBuffer() }
-            .context("failed to convert Media Foundation sample to a contiguous buffer")?;
-
-        let mut ptr = std::ptr::null_mut();
-        let mut _max_len = 0;
-        let mut current_len = 0;
-        unsafe {
-            buffer
-                .Lock(&mut ptr, Some(&mut _max_len), Some(&mut current_len))
-                .context("failed to lock Media Foundation sample buffer")?;
-        }
-        scopeguard::defer! {
-            unsafe {
-                let _ = buffer.Unlock();
-            }
+        if self.nv12.is_some()
+            && stream_flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32 != 0
+        {
+            let layout =
+                nv12::current_layout(source_reader, self.source_width, self.source_height)?;
+            anyhow::ensure!(
+                self.nv12 == Some(layout),
+                "native format changed after color verification"
+            );
         }
 
-        if ptr.is_null() {
-            bail!("Media Foundation returned a null frame buffer");
-        }
-
-        let source_stride = match sample_2d_stride {
-            Some(stride) => stride,
-            None => sample_stride(
-                self.source_width,
-                self.source_height,
-                self.source_stride,
-                current_len,
-            )?,
+        let sample_2d_stride = if self.nv12.is_none() {
+            sample_2d_stride(&sample, self.source_width)?
+        } else {
+            None
         };
-        let required_len = frame_buffer_len(source_stride.bytes_per_row, self.source_height)?;
-        if (current_len as usize) < required_len {
-            bail!(
+        with_sample_buffer(&sample, |source| {
+            let current_len = source.len() as u32;
+            if let Some(layout) = self.nv12 {
+                nv12::ensure_progressive(&sample, layout)?;
+                let time = self.timestamp_clock.media_time_from_hns(timestamp_100ns)?;
+                return nv12::to_bgra(source, layout, self.width, self.height, time)?
+                    .rotated(self.display_rotation)
+                    .map(Some);
+            }
+
+            let source_stride = match sample_2d_stride {
+                Some(stride) => stride,
+                None => sample_stride(
+                    self.source_width,
+                    self.source_height,
+                    self.source_stride,
+                    current_len,
+                )?,
+            };
+            let required_len = frame_buffer_len(source_stride.bytes_per_row, self.source_height)?;
+            if (current_len as usize) < required_len {
+                bail!(
                 "Media Foundation returned a frame buffer that is too short; got {} bytes, need {required_len}",
                 current_len
             );
-        }
-        let source = unsafe { std::slice::from_raw_parts(ptr, required_len) };
-        let time = self.timestamp_clock.media_time_from_hns(timestamp_100ns)?;
+            }
+            let source = &source[..required_len];
+            let time = self.timestamp_clock.media_time_from_hns(timestamp_100ns)?;
 
-        let frame = match self.software_resize {
-            Some((width, height)) if source_stride.rows_are_top_down => resize_bgra(
-                source,
-                self.source_width,
-                self.source_height,
-                source_stride.bytes_per_row,
-                width,
-                height,
-                time,
-            ),
-            Some((width, height)) => {
-                let source = compact_bgra(
+            let frame = match self.software_resize {
+                Some((width, height)) if source_stride.rows_are_top_down => resize_bgra(
+                    source,
+                    self.source_width,
+                    self.source_height,
+                    source_stride.bytes_per_row,
+                    width,
+                    height,
+                    time,
+                ),
+                Some((width, height)) => {
+                    let source = compact_bgra(
+                        source,
+                        self.source_width,
+                        self.source_height,
+                        source_stride,
+                        time,
+                    )?;
+                    resize_bgra(
+                        &source.data,
+                        source.width,
+                        source.height,
+                        source.bytes_per_row,
+                        width,
+                        height,
+                        time,
+                    )
+                }
+                None if source_stride.rows_are_top_down => VideoFrame::new_bgra(
+                    self.width,
+                    self.height,
+                    source_stride.bytes_per_row,
+                    time,
+                    source.to_vec(),
+                ),
+                None => compact_bgra(
                     source,
                     self.source_width,
                     self.source_height,
                     source_stride,
                     time,
-                )?;
-                resize_bgra(
-                    &source.data,
-                    source.width,
-                    source.height,
-                    source.bytes_per_row,
-                    width,
-                    height,
-                    time,
-                )
-            }
-            None if source_stride.rows_are_top_down => VideoFrame::new_bgra(
-                self.width,
-                self.height,
-                source_stride.bytes_per_row,
-                time,
-                source.to_vec(),
-            ),
-            None => compact_bgra(
-                source,
-                self.source_width,
-                self.source_height,
-                source_stride,
-                time,
-            ),
-        }?;
+                ),
+            }?;
 
-        frame.rotated(self.display_rotation).map(Some)
-    }
-
-    fn duration(&self) -> Option<MediaTime> {
-        self.duration
+            frame.rotated(self.display_rotation).map(Some)
+        })
     }
 }
 
 fn native_media_type(source_reader: &IMFSourceReader) -> anyhow::Result<IMFMediaType> {
     unsafe { source_reader.GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, 0) }
         .context("failed to get native video media type")
+}
+
+// The slice cannot outlive the lock. Unlock also runs on errors and unwinding.
+fn with_sample_buffer<T>(
+    sample: &IMFSample,
+    read: impl FnOnce(&[u8]) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let buffer = unsafe { sample.ConvertToContiguousBuffer() }
+        .context("failed to make Media Foundation sample contiguous")?;
+    let mut ptr = std::ptr::null_mut();
+    let mut len = 0;
+    unsafe { buffer.Lock(&mut ptr, None, Some(&mut len)) }
+        .context("failed to lock Media Foundation sample buffer")?;
+    scopeguard::defer! { unsafe { let _ = buffer.Unlock(); } }
+    anyhow::ensure!(
+        !ptr.is_null(),
+        "Media Foundation returned a null frame buffer"
+    );
+    anyhow::ensure!(
+        len as usize <= isize::MAX as usize,
+        "Media Foundation sample is too large"
+    );
+    // SAFETY: Lock returned this pointer and byte count; the buffer stays locked
+    // and alive until the callback returns. No borrowed data can escape.
+    read(unsafe { std::slice::from_raw_parts(ptr, len as usize) })
 }
 
 fn configure_bgra_format(
@@ -633,6 +812,15 @@ fn resize_bgra(
     target_height: u32,
     time: MediaTime,
 ) -> anyhow::Result<VideoFrame> {
+    validate_bgra_buffer(
+        source_width,
+        source_height,
+        source_bytes_per_row,
+        source.len(),
+    )?;
+    if target_width == 0 || target_height == 0 {
+        bail!("resized frame dimensions must be non-zero");
+    }
     let target_bytes_per_row = target_width
         .checked_mul(4)
         .context("resized row width overflowed")?;
@@ -640,12 +828,47 @@ fn resize_bgra(
 
     let source_x = sample_coordinates(target_width as usize, source_width as usize);
     let source_y = sample_coordinates(target_height as usize, source_height as usize);
+    let half_weights = source_x
+        .iter()
+        .chain(&source_y)
+        .all(|coordinate| coordinate.weight == 0.5);
     for (target_y, sample_y) in source_y.into_iter().enumerate() {
+        let top_offset = sample_y.lower * source_bytes_per_row as usize;
+        let bottom_offset = sample_y.upper * source_bytes_per_row as usize;
+        let top_row = &source[top_offset..top_offset + source_width as usize * 4];
+        let bottom_row = &source[bottom_offset..bottom_offset + source_width as usize * 4];
         for (target_x, sample_x) in source_x.iter().copied().enumerate() {
             let target_offset = target_y * target_bytes_per_row as usize + target_x * 4;
+            let left = sample_x.lower * 4;
+            let right = sample_x.upper * 4;
+            let top_left = &top_row[left..left + 4];
+            let top_right = &top_row[right..right + 4];
+            let bottom_left = &bottom_row[left..left + 4];
+            let bottom_right = &bottom_row[right..right + 4];
+            if half_weights {
+                for channel in 0..4 {
+                    data[target_offset + channel] = ((u16::from(top_left[channel])
+                        + u16::from(top_right[channel])
+                        + u16::from(bottom_left[channel])
+                        + u16::from(bottom_right[channel])
+                        + 2)
+                        >> 2) as u8;
+                }
+                continue;
+            }
             for channel in 0..4 {
+                let top = mix(
+                    top_left[channel] as f32,
+                    top_right[channel] as f32,
+                    sample_x.weight,
+                );
+                let bottom = mix(
+                    bottom_left[channel] as f32,
+                    bottom_right[channel] as f32,
+                    sample_x.weight,
+                );
                 data[target_offset + channel] =
-                    sample_bgra_channel(source, source_bytes_per_row, sample_x, sample_y, channel)?;
+                    mix(top, bottom, sample_y.weight).round().clamp(0.0, 255.0) as u8;
             }
         }
     }
@@ -1100,6 +1323,7 @@ fn source_coordinate(target: usize, target_len: usize, source_len: usize) -> Sam
     }
 }
 
+#[cfg(test)]
 fn sample_bgra_channel(
     source: &[u8],
     bytes_per_row: u32,
@@ -1121,6 +1345,7 @@ fn sample_bgra_channel(
     Ok(mix(top, bottom, y.weight).round().clamp(0.0, 255.0) as u8)
 }
 
+#[cfg(test)]
 fn source_channel(
     source: &[u8],
     bytes_per_row: u32,
@@ -1351,6 +1576,126 @@ unsafe fn mf_set_attribute_size(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rgb_verification_ignores_only_unused_alpha_and_padding() {
+        let time = MediaTime::new(1, 30).unwrap();
+        let a = VideoFrame::new_bgra(1, 2, 4, time, vec![1, 2, 3, 0, 4, 5, 6, 0]).unwrap();
+        let mut b = VideoFrame::new_bgra(
+            1,
+            2,
+            8,
+            time,
+            vec![1, 2, 3, 255, 9, 9, 9, 9, 4, 5, 6, 255, 9, 9, 9, 9],
+        )
+        .unwrap();
+        assert!(nv12::same_rgb_frame(&a, &b));
+        b.data[8] += 1;
+        assert!(!nv12::same_rgb_frame(&a, &b));
+        b.data[8] -= 1;
+        b.time.value += 1;
+        assert!(!nv12::same_rgb_frame(&a, &b));
+    }
+
+    #[test]
+    #[ignore = "requires SEGMENTER_TEST_VIDEO; optionally SEGMENTER_TEST_DIMENSION"]
+    fn native_decode_matches_rgb() -> anyhow::Result<()> {
+        compare_video_with_rgb(None)
+    }
+
+    #[test]
+    #[ignore = "requires an NV12-compatible SEGMENTER_TEST_VIDEO with at least 20 frames"]
+    fn native_fallback_preserves_frames() -> anyhow::Result<()> {
+        compare_video_with_rgb(Some(19))
+    }
+
+    fn compare_video_with_rgb(fallback_at: Option<u64>) -> anyhow::Result<()> {
+        let input = std::env::var("SEGMENTER_TEST_VIDEO")?;
+        let max_dimension = std::env::var("SEGMENTER_TEST_DIMENSION")
+            .ok()
+            .map(|v| v.parse())
+            .transpose()?;
+        let options = DecodeOptions { max_dimension };
+        let mut candidate = MediaFoundationDecoder::new(Path::new(&input), options)?;
+        let mut reference =
+            MediaFoundationDecoder::new_with_nv12(Path::new(&input), options, false)?;
+        let mut frames = 0;
+        loop {
+            if fallback_at == Some(frames) {
+                // Trigger recovery after a sample has been read and mapped.
+                candidate
+                    .nv12
+                    .as_mut()
+                    .context("fault injection requires NV12")?
+                    .coded_height = usize::MAX;
+            }
+            match (candidate.read_frame()?, reference.read_frame()?) {
+                (None, None) => break,
+                (Some(actual), Some(expected)) => {
+                    anyhow::ensure!(
+                        nv12::same_rgb_frame(&actual, &expected),
+                        "frame {frames}: RGB pixels, dimensions or timestamps differ"
+                    );
+                }
+                _ => bail!("frame counts differ at {frames}"),
+            }
+            frames += 1;
+        }
+        anyhow::ensure!(
+            frames > fallback_at.unwrap_or(0),
+            "video is too short for this check"
+        );
+        eprintln!("QUALITY: all {frames} decoded RGB frames and timestamps match");
+        Ok(())
+    }
+
+    #[test]
+    fn resized_pixels_match_original_for_padding_and_degenerate_dimensions() {
+        use super::*;
+        for (sw, sh, tw, th) in [
+            (17, 13, 6, 4),
+            (3, 2, 10, 8),
+            (1, 5, 7, 1),
+            (9, 1, 1, 7),
+            (8, 6, 8, 6),
+            (32, 24, 8, 6),
+            (8, 6, 4, 3),
+        ] {
+            let stride = sw * 4 + 12;
+            let source: Vec<u8> = (0..stride * sh)
+                .map(|i| ((i * 73 + i / 7) % 256) as u8)
+                .collect();
+            let result = resize_bgra(
+                &source,
+                sw,
+                sh,
+                stride,
+                tw,
+                th,
+                MediaTime::new(0, 1).unwrap(),
+            )
+            .unwrap();
+            for y in 0..th as usize {
+                for x in 0..tw as usize {
+                    for c in 0..4 {
+                        let expected = sample_bgra_channel(
+                            &source,
+                            stride,
+                            source_coordinate(x, tw as usize, sw as usize),
+                            source_coordinate(y, th as usize, sh as usize),
+                            c,
+                        )
+                        .unwrap();
+                        assert_eq!(result.data[(y * tw as usize + x) * 4 + c], expected);
+                    }
+                }
+            }
+        }
+        assert!(
+            super::resize_bgra(&[0; 4], 2, 2, 8, 1, 1, super::MediaTime::new(0, 1).unwrap())
+                .is_err()
+        );
+    }
+
     use super::*;
     use std::io::Write;
 
