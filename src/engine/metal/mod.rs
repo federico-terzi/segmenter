@@ -9,7 +9,7 @@ use anyhow::{bail, Context};
 
 use crate::{
     engine::Engine,
-    frame::{MediaTime, PixelFormat, VideoFrame},
+    frame::{validate_bgra_buffer, PixelFormat, VideoFrame},
 };
 
 const ERROR_LEN: usize = 4096;
@@ -27,13 +27,14 @@ extern "C" {
     ) -> *mut SegmenterRvmMetalContext;
     fn segmenter_rvm_metal_run(
         context: *mut SegmenterRvmMetalContext,
-        input_nchw: *const f32,
+        bgra: *const u8,
         input_len: usize,
         width: u32,
         height: u32,
+        bytes_per_row: u32,
         downsample_ratio: f32,
-        alpha_nchw: *mut f32,
-        alpha_len: usize,
+        mask: *mut u8,
+        mask_len: usize,
         error: *mut c_char,
         error_len: usize,
     ) -> c_int;
@@ -81,19 +82,29 @@ impl Engine for MetalEngine {
             bail!("RVM Metal engine only accepts BGRA frames");
         }
 
-        let input = preprocess_f32(frame)?;
-        let mut alpha = vec![0.0_f32; frame.width as usize * frame.height as usize];
+        validate_bgra_buffer(
+            frame.width,
+            frame.height,
+            frame.bytes_per_row,
+            frame.data.len(),
+        )?;
+        let bytes_per_row = frame
+            .width
+            .checked_mul(4)
+            .context("RVM Metal mask row width overflowed")?;
+        let mut mask = vec![0u8; bytes_per_row as usize * frame.height as usize];
         let mut error = ErrorBuffer::new();
         let status = unsafe {
             segmenter_rvm_metal_run(
                 self.context.as_ptr(),
-                input.as_ptr(),
-                input.len(),
+                frame.data.as_ptr(),
+                frame.data.len(),
                 frame.width,
                 frame.height,
+                frame.bytes_per_row,
                 self.downsample_ratio,
-                alpha.as_mut_ptr(),
-                alpha.len(),
+                mask.as_mut_ptr(),
+                mask.len(),
                 error.as_mut_ptr(),
                 ERROR_LEN,
             )
@@ -102,7 +113,7 @@ impl Engine for MetalEngine {
             return Err(error.into_error("RVM Metal inference failed"));
         }
 
-        alpha_to_mask(&alpha, frame.width, frame.height, frame.time)
+        VideoFrame::new_bgra(frame.width, frame.height, bytes_per_row, frame.time, mask)
     }
 }
 
@@ -110,60 +121,6 @@ impl Drop for MetalEngine {
     fn drop(&mut self) {
         unsafe { segmenter_rvm_metal_destroy(self.context.as_ptr()) }
     }
-}
-
-fn preprocess_f32(frame: &VideoFrame) -> anyhow::Result<Vec<f32>> {
-    let plane_len = frame.width as usize * frame.height as usize;
-    let mut tensor = vec![0.0_f32; plane_len * 3];
-
-    for y in 0..frame.height as usize {
-        for x in 0..frame.width as usize {
-            let pixel_index = y * frame.width as usize + x;
-            let source = frame.checked_pixel_offset(x as u32, y as u32)?;
-            tensor[pixel_index] = frame.data[source + 2] as f32 / 255.0;
-            tensor[plane_len + pixel_index] = frame.data[source + 1] as f32 / 255.0;
-            tensor[2 * plane_len + pixel_index] = frame.data[source] as f32 / 255.0;
-        }
-    }
-
-    Ok(tensor)
-}
-
-fn alpha_to_mask(
-    alpha: &[f32],
-    width: u32,
-    height: u32,
-    time: MediaTime,
-) -> anyhow::Result<VideoFrame> {
-    let expected = width as usize * height as usize;
-    if alpha.len() != expected {
-        bail!(
-            "RVM Metal alpha output had invalid length: expected {}, got {}",
-            expected,
-            alpha.len()
-        );
-    }
-
-    let bytes_per_row = width
-        .checked_mul(4)
-        .context("RVM Metal mask row width overflowed")?;
-    let mut data = vec![0_u8; bytes_per_row as usize * height as usize];
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            let value = alpha[y * width as usize + x];
-            if !value.is_finite() {
-                bail!("RVM Metal alpha output contained a non-finite value");
-            }
-            let alpha = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-            let offset = y * bytes_per_row as usize + x * 4;
-            data[offset] = alpha;
-            data[offset + 1] = alpha;
-            data[offset + 2] = alpha;
-            data[offset + 3] = 255;
-        }
-    }
-
-    VideoFrame::new_bgra(width, height, bytes_per_row, time, data)
 }
 
 struct ErrorBuffer {

@@ -64,6 +64,7 @@ fn cc_config() {
     println!("cargo:rustc-link-lib=framework=Foundation");
     if engine_metal_enabled {
         println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
         println!("cargo:rustc-link-lib=framework=MetalPerformanceShadersGraph");
     }
 }
