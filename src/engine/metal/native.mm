@@ -19,6 +19,38 @@
 #include <utility>
 #include <vector>
 
+// MPSGraph can replace the underlying buffer while encoding. Keep every submitted
+// buffer so an earlier failure cannot be hidden by a successful final mask buffer.
+@interface SegmenterCommandBuffer : MPSCommandBuffer {
+    NSMutableArray<id<MTLCommandBuffer>> *_submittedBuffers;
+}
+- (NSError *)waitForExecution;
+@end
+
+@implementation SegmenterCommandBuffer
+- (void)commitAndContinue {
+    if (_submittedBuffers == nil) _submittedBuffers = [[NSMutableArray alloc] init];
+    [_submittedBuffers addObject:self.rootCommandBuffer];
+    [super commitAndContinue];
+}
+
+- (NSError *)waitForExecution {
+    // All work has already been committed: these waits do not split GPU execution.
+    [self.rootCommandBuffer waitUntilCompleted];
+    NSError *error = nil;
+    for (id<MTLCommandBuffer> buffer in _submittedBuffers) {
+        [buffer waitUntilCompleted];
+        if (error == nil) error = buffer.error;
+    }
+    return error != nil ? error : self.rootCommandBuffer.error;
+}
+
+- (void)dealloc {
+    [_submittedBuffers release];
+    [super dealloc];
+}
+@end
+
 namespace {
 
 constexpr char kMagic[8] = {'R', 'V', 'M', 'M', 'E', 'T', 'A', 'L'};
@@ -1495,7 +1527,9 @@ extern "C" int segmenter_rvm_metal_run(
                 for (size_t y = 0; y < height; ++y) std::memcpy(upload + y * row_len, bgra + y * bytes_per_row, row_len);
             }
             *static_cast<uint32_t *>([runtime->invalid_buffer contents]) = 0;
-            MPSCommandBuffer *command = [MPSCommandBuffer commandBufferFromCommandQueue:context->command_queue];
+            id<MTLCommandBuffer> root = [context->command_queue commandBuffer];
+            if (root == nil) fail("failed to create Metal command buffer");
+            SegmenterCommandBuffer *command = [[[SegmenterCommandBuffer alloc] initWithCommandBuffer:root] autorelease];
             if (command == nil) fail("failed to create Metal command buffer");
             encode_pixels(command, context->unpack_pipeline, runtime->bgra_buffer,
                           runtime->input_buffer, context->normalized_bytes, static_cast<uint32_t>(count));
@@ -1508,8 +1542,8 @@ extern "C" int segmenter_rvm_metal_run(
             encode_pixels(command, mask_pipeline, runtime->alpha_buffer, runtime->mask_buffer,
                           runtime->invalid_buffer, static_cast<uint32_t>(count));
             [command commit];
-            [command waitUntilCompleted];
-            if (command.error != nil) fail(std::string("RVM Metal command failed: ") + [[command.error localizedDescription] UTF8String]);
+            NSError *command_error = [command waitForExecution];
+            if (command_error != nil) fail(std::string("RVM Metal command failed: ") + [[command_error localizedDescription] UTF8String]);
             if (*static_cast<uint32_t *>([runtime->invalid_buffer contents]) != 0) {
                 fail("RVM Metal alpha output contained a non-finite value");
             }
