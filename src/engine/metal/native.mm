@@ -19,6 +19,38 @@
 #include <utility>
 #include <vector>
 
+// MPSGraph can replace the underlying buffer while encoding. Keep every submitted
+// buffer so an earlier failure cannot be hidden by a successful final mask buffer.
+@interface SegmenterCommandBuffer : MPSCommandBuffer {
+    NSMutableArray<id<MTLCommandBuffer>> *_submittedBuffers;
+}
+- (NSError *)waitForExecution;
+@end
+
+@implementation SegmenterCommandBuffer
+- (void)commitAndContinue {
+    if (_submittedBuffers == nil) _submittedBuffers = [[NSMutableArray alloc] init];
+    [_submittedBuffers addObject:self.rootCommandBuffer];
+    [super commitAndContinue];
+}
+
+- (NSError *)waitForExecution {
+    // All work has already been committed: these waits do not split GPU execution.
+    [self.rootCommandBuffer waitUntilCompleted];
+    NSError *error = nil;
+    for (id<MTLCommandBuffer> buffer in _submittedBuffers) {
+        [buffer waitUntilCompleted];
+        if (error == nil) error = buffer.error;
+    }
+    return error != nil ? error : self.rootCommandBuffer.error;
+}
+
+- (void)dealloc {
+    [_submittedBuffers release];
+    [super dealloc];
+}
+@end
+
 namespace {
 
 constexpr char kMagic[8] = {'R', 'V', 'M', 'M', 'E', 'T', 'A', 'L'};
@@ -424,13 +456,31 @@ struct GraphRuntime {
     std::array<MPSGraphTensor *, 5> targets = {};
     std::array<MPSDataType, 5> target_dtypes = {};
     std::array<std::vector<uint32_t>, 5> target_shapes = {};
-    std::array<id<MTLBuffer>, 4> recurrent_buffers = {};
+    id<MTLBuffer> input_buffer = nil;
+    id<MTLBuffer> alpha_buffer = nil;
+    id<MTLBuffer> bgra_buffer = nil;
+    id<MTLBuffer> mask_buffer = nil;
+    id<MTLBuffer> invalid_buffer = nil;
+    // Alternate banks: recurrent inputs must not alias the outputs of the same frame.
+    std::array<std::array<id<MTLBuffer>, 4>, 2> recurrent_buffers = {};
+    std::array<NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *, 2> feeds = {};
+    std::array<NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *, 2> results = {};
+    size_t next = 0;
 
     ~GraphRuntime() {
-        [graph release];
-        for (id<MTLBuffer> buffer : recurrent_buffers) {
-            [buffer release];
+        for (size_t bank = 0; bank < 2; ++bank) {
+            [feeds[bank] release];
+            [results[bank] release];
+            for (id<MTLBuffer> buffer : recurrent_buffers[bank]) {
+                [buffer release];
+            }
         }
+        [input_buffer release];
+        [alpha_buffer release];
+        [bgra_buffer release];
+        [mask_buffer release];
+        [invalid_buffer release];
+        [graph release];
     }
 };
 
@@ -441,10 +491,18 @@ struct SegmenterRvmMetalContext {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> command_queue = nil;
     MPSGraphDevice *graph_device = nil;
+    id<MTLComputePipelineState> unpack_pipeline = nil;
+    id<MTLComputePipelineState> mask_f16_pipeline = nil;
+    id<MTLComputePipelineState> mask_f32_pipeline = nil;
+    id<MTLBuffer> normalized_bytes = nil;
     std::unique_ptr<GraphRuntime> runtime;
 
     ~SegmenterRvmMetalContext() {
         runtime.reset();
+        [unpack_pipeline release];
+        [mask_f16_pipeline release];
+        [mask_f32_pipeline release];
+        [normalized_bytes release];
         [graph_device release];
         [command_queue release];
         [device release];
@@ -452,6 +510,86 @@ struct SegmenterRvmMetalContext {
 };
 
 namespace {
+
+// The lookup table preserves Rust's f32 byte / 255.0 exactly, including for f32 models.
+// Disable fast math below so clamping, non-finite validation, and rounding match the CPU path.
+NSString *const kPixelKernels = @R"metal(
+#include <metal_stdlib>
+using namespace metal;
+kernel void unpack_bgra(device const uchar4 *bgra [[buffer(0)]],
+                        device float *rgb [[buffer(1)]],
+                        constant float *normalized [[buffer(2)]],
+                        constant uint &count [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    if (i >= count) return;
+    uchar4 p = bgra[i];
+    rgb[i] = normalized[p.z];
+    rgb[count + i] = normalized[p.y];
+    rgb[count * 2 + i] = normalized[p.x];
+}
+template<typename T>
+void write_mask(device const T *alpha, device uchar4 *mask, device atomic_uint *invalid, uint i) {
+    float value = float(alpha[i]);
+    if (!isfinite(value)) {
+        atomic_store_explicit(invalid, 1u, memory_order_relaxed);
+        value = 0.0f;
+    }
+    uchar a = uchar(round(clamp(value, 0.0f, 1.0f) * 255.0f));
+    mask[i] = uchar4(a, a, a, 255);
+}
+kernel void mask_f16(device const half *alpha [[buffer(0)]], device uchar4 *mask [[buffer(1)]],
+                     device atomic_uint *invalid [[buffer(2)]], constant uint &count [[buffer(3)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i < count) write_mask(alpha, mask, invalid, i);
+}
+kernel void mask_f32(device const float *alpha [[buffer(0)]], device uchar4 *mask [[buffer(1)]],
+                     device atomic_uint *invalid [[buffer(2)]], constant uint &count [[buffer(3)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i < count) write_mask(alpha, mask, invalid, i);
+}
+)metal";
+
+void ensure_pixel_pipelines(SegmenterRvmMetalContext *context) {
+    if (context->unpack_pipeline != nil) return;
+    MTLCompileOptions *options = [[[MTLCompileOptions alloc] init] autorelease];
+    options.fastMathEnabled = NO;
+    NSError *error = nil;
+    id<MTLLibrary> library = [[context->device newLibraryWithSource:kPixelKernels options:options error:&error] autorelease];
+    if (library == nil) fail(std::string("failed to compile Metal pixel kernels: ") + [[error localizedDescription] UTF8String]);
+    auto pipeline = [&](NSString *name) {
+        id<MTLFunction> function = [[library newFunctionWithName:name] autorelease];
+        id<MTLComputePipelineState> result = [context->device newComputePipelineStateWithFunction:function error:&error];
+        if (result == nil) fail("failed to create Metal pixel pipeline");
+        return [result autorelease];
+    };
+    id<MTLComputePipelineState> mask_f16 = pipeline(@"mask_f16");
+    id<MTLComputePipelineState> mask_f32 = pipeline(@"mask_f32");
+    id<MTLComputePipelineState> unpack = pipeline(@"unpack_bgra");
+    std::array<float, 256> normalized;
+    for (size_t i = 0; i < normalized.size(); ++i) normalized[i] = static_cast<float>(i) / 255.0f;
+    id<MTLBuffer> table = [[context->device newBufferWithBytes:normalized.data()
+        length:sizeof(normalized) options:MTLResourceStorageModeShared] autorelease];
+    if (table == nil) fail("failed to allocate Metal normalization table");
+    // Publish only after every resource exists; failed initialization can be retried safely.
+    context->mask_f16_pipeline = [mask_f16 retain];
+    context->mask_f32_pipeline = [mask_f32 retain];
+    context->normalized_bytes = [table retain];
+    context->unpack_pipeline = [unpack retain];
+}
+
+void encode_pixels(MPSCommandBuffer *command, id<MTLComputePipelineState> pipeline,
+                   id<MTLBuffer> input, id<MTLBuffer> output, id<MTLBuffer> extra, uint32_t count) {
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    if (encoder == nil) fail("failed to create Metal pixel command encoder");
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:input offset:0 atIndex:0];
+    [encoder setBuffer:output offset:0 atIndex:1];
+    [encoder setBuffer:extra offset:0 atIndex:2];
+    [encoder setBytes:&count length:sizeof(count) atIndex:3];
+    NSUInteger threads = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
+    [encoder dispatchThreadgroups:MTLSizeMake((count + threads - 1) / threads, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    [encoder endEncoding];
+}
 
 struct BuildContext {
     SegmenterRvmMetalContext *context = nullptr;
@@ -1224,8 +1362,11 @@ std::unique_ptr<GraphRuntime> build_runtime(SegmenterRvmMetalContext *context, u
     runtime->targets[0] = pha.tensor;
     runtime->target_dtypes[0] = pha.dtype;
     runtime->target_shapes[0] = pha.shape;
-    if (pha.shape.size() != 4 || pha.shape[2] != height || pha.shape[3] != width) {
+    if (pha.shape != std::vector<uint32_t>({1, 1, height, width})) {
         fail("RVM Metal alpha output shape did not match input frame");
+    }
+    if (pha.dtype != MPSDataTypeFloat16 && pha.dtype != MPSDataTypeFloat32) {
+        fail("RVM Metal alpha output had an unsupported dtype");
     }
 
     for (size_t i = 0; i < 4; ++i) {
@@ -1273,28 +1414,47 @@ void ensure_runtime(SegmenterRvmMetalContext *context, uint32_t width, uint32_t 
         return;
     }
 
-    context->runtime = build_runtime(context, width, height, downsample_ratio);
-    for (size_t i = 0; i < 4; ++i) {
-        context->runtime->recurrent_buffers[i] = new_zero_buffer(
-            context->device,
-            context->runtime->recurrent_shapes[i],
-            mps_dtype(context->model.model_dtype));
+    auto runtime = build_runtime(context, width, height, downsample_ratio);
+    runtime->input_buffer = [context->device newBufferWithLength:static_cast<size_t>(width) * height * 3 * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+    runtime->alpha_buffer = [context->device newBufferWithLength:element_count(runtime->target_shapes[0]) * mps_dtype_size(runtime->target_dtypes[0])
+                                                       options:MTLResourceStorageModeShared];
+    const size_t bgra_len = static_cast<size_t>(width) * height * 4;
+    runtime->bgra_buffer = [context->device newBufferWithLength:bgra_len options:MTLResourceStorageModeShared];
+    runtime->mask_buffer = [context->device newBufferWithLength:bgra_len options:MTLResourceStorageModeShared];
+    runtime->invalid_buffer = [context->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    if (runtime->input_buffer == nil || runtime->alpha_buffer == nil ||
+        runtime->bgra_buffer == nil || runtime->mask_buffer == nil || runtime->invalid_buffer == nil) {
+        fail("failed to allocate RVM Metal input/output buffers");
     }
-}
-
-void copy_alpha_to_f32(const void *source, MPSDataType dtype, size_t count, float *target) {
-    if (dtype == MPSDataTypeFloat32) {
-        std::memcpy(target, source, count * sizeof(float));
-        return;
-    }
-    if (dtype == MPSDataTypeFloat16) {
-        const uint16_t *half = reinterpret_cast<const uint16_t *>(source);
-        for (size_t i = 0; i < count; ++i) {
-            target[i] = half_to_float(half[i]);
+    for (size_t bank = 0; bank < 2; ++bank) {
+        for (size_t i = 0; i < 4; ++i) {
+            if (runtime->recurrent_shapes[i] != runtime->target_shapes[i + 1] ||
+                runtime->target_dtypes[i + 1] != mps_dtype(context->model.model_dtype)) {
+                fail("RVM Metal recurrent input/output shapes or types do not match");
+            }
+            runtime->recurrent_buffers[bank][i] = new_zero_buffer(
+                context->device, runtime->recurrent_shapes[i], mps_dtype(context->model.model_dtype));
         }
-        return;
     }
-    fail("RVM Metal alpha output had an unsupported dtype");
+    auto tensor_data = [](id<MTLBuffer> buffer, const std::vector<uint32_t> &shape, MPSDataType dtype) {
+        return [[[MPSGraphTensorData alloc] initWithMTLBuffer:buffer shape:make_shape(shape) dataType:dtype] autorelease];
+    };
+    for (size_t bank = 0; bank < 2; ++bank) {
+        NSMutableDictionary *feeds = [NSMutableDictionary dictionaryWithCapacity:5];
+        NSMutableDictionary *results = [NSMutableDictionary dictionaryWithCapacity:5];
+        feeds[runtime->src_feed] = tensor_data(runtime->input_buffer, {1, 3, height, width}, MPSDataTypeFloat32);
+        results[runtime->targets[0]] = tensor_data(runtime->alpha_buffer, runtime->target_shapes[0], runtime->target_dtypes[0]);
+        for (size_t i = 0; i < 4; ++i) {
+            feeds[runtime->recurrent_feeds[i]] = tensor_data(runtime->recurrent_buffers[bank][i],
+                runtime->recurrent_shapes[i], mps_dtype(context->model.model_dtype));
+            results[runtime->targets[i + 1]] = tensor_data(runtime->recurrent_buffers[bank ^ 1][i],
+                runtime->target_shapes[i + 1], runtime->target_dtypes[i + 1]);
+        }
+        runtime->feeds[bank] = [feeds copy];
+        runtime->results[bank] = [results copy];
+    }
+    context->runtime = std::move(runtime);
 }
 
 } // namespace
@@ -1310,11 +1470,11 @@ extern "C" SegmenterRvmMetalContext *segmenter_rvm_metal_create(
             }
             std::unique_ptr<SegmenterRvmMetalContext> context(new SegmenterRvmMetalContext());
             context->model = load_model(model_path);
-            context->device = [MTLCreateSystemDefaultDevice() retain];
+            context->device = MTLCreateSystemDefaultDevice();
             if (context->device == nil) {
                 fail("failed to create Metal device");
             }
-            context->command_queue = [[context->device newCommandQueue] retain];
+            context->command_queue = [context->device newCommandQueue];
             if (context->command_queue == nil) {
                 fail("failed to create Metal command queue");
             }
@@ -1335,84 +1495,60 @@ extern "C" SegmenterRvmMetalContext *segmenter_rvm_metal_create(
 
 extern "C" int segmenter_rvm_metal_run(
     SegmenterRvmMetalContext *context,
-    const float *input_nchw,
+    const uint8_t *bgra,
     size_t input_len,
     uint32_t width,
     uint32_t height,
+    uint32_t bytes_per_row,
     float downsample_ratio,
-    float *alpha_nchw,
-    size_t alpha_len,
+    uint8_t *mask,
+    size_t mask_len,
     char *error,
     size_t error_len) {
     @autoreleasepool {
         try {
-            if (context == nullptr || input_nchw == nullptr || alpha_nchw == nullptr) {
-                fail("null pointer passed to RVM Metal run");
-            }
-            const size_t expected_input = static_cast<size_t>(width) * height * 3;
-            const size_t expected_alpha = static_cast<size_t>(width) * height;
-            if (input_len != expected_input || alpha_len != expected_alpha) {
-                fail("RVM Metal input/output length mismatch");
+            if (context == nullptr || bgra == nullptr || mask == nullptr) fail("null pointer passed to RVM Metal run");
+            const size_t count = static_cast<size_t>(width) * height;
+            const size_t row_len = static_cast<size_t>(width) * 4;
+            if (width == 0 || height == 0 || count > UINT32_MAX / 3 || bytes_per_row < row_len ||
+                input_len < static_cast<size_t>(bytes_per_row) * height || mask_len != count * 4) {
+                fail("RVM Metal BGRA dimensions or buffer length mismatch");
             }
             if (!std::isfinite(downsample_ratio) || downsample_ratio <= 0.0f || downsample_ratio > 1.0f) {
                 fail("RVM Metal downsample ratio must be within (0, 1]");
             }
-
             ensure_runtime(context, width, height, downsample_ratio);
+            ensure_pixel_pipelines(context);
             GraphRuntime *runtime = context->runtime.get();
-
-            NSMutableDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feeds = [NSMutableDictionary dictionaryWithCapacity:5];
-            id<MTLBuffer> input_buffer = [context->device newBufferWithBytes:input_nchw
-                                                                       length:input_len * sizeof(float)
-                                                                      options:MTLResourceStorageModeShared];
-            if (input_buffer == nil) {
-                fail("failed to allocate RVM Metal input buffer");
+            uint8_t *upload = static_cast<uint8_t *>([runtime->bgra_buffer contents]);
+            if (bytes_per_row == row_len) {
+                std::memcpy(upload, bgra, mask_len);
+            } else {
+                for (size_t y = 0; y < height; ++y) std::memcpy(upload + y * row_len, bgra + y * bytes_per_row, row_len);
             }
-            MPSGraphTensorData *input_data = [[[MPSGraphTensorData alloc] initWithMTLBuffer:input_buffer
-                                                                                      shape:make_shape({1, 3, height, width})
-                                                                                   dataType:MPSDataTypeFloat32] autorelease];
-            [feeds setObject:input_data forKey:runtime->src_feed];
-
-            for (size_t i = 0; i < 4; ++i) {
-                MPSGraphTensorData *state_data = [[[MPSGraphTensorData alloc] initWithMTLBuffer:runtime->recurrent_buffers[i]
-                                                                                          shape:make_shape(runtime->recurrent_shapes[i])
-                                                                                       dataType:mps_dtype(context->model.model_dtype)] autorelease];
-                [feeds setObject:state_data forKey:runtime->recurrent_feeds[i]];
+            *static_cast<uint32_t *>([runtime->invalid_buffer contents]) = 0;
+            id<MTLCommandBuffer> root = [context->command_queue commandBuffer];
+            if (root == nil) fail("failed to create Metal command buffer");
+            SegmenterCommandBuffer *command = [[[SegmenterCommandBuffer alloc] initWithCommandBuffer:root] autorelease];
+            if (command == nil) fail("failed to create Metal command buffer");
+            encode_pixels(command, context->unpack_pipeline, runtime->bgra_buffer,
+                          runtime->input_buffer, context->normalized_bytes, static_cast<uint32_t>(count));
+            // Shared buffers become CPU-visible when this command completes. Recurrent state stays on the GPU.
+            runtime->graph.options = MPSGraphOptionsNone;
+            [runtime->graph encodeToCommandBuffer:command feeds:runtime->feeds[runtime->next]
+                targetOperations:nil resultsDictionary:runtime->results[runtime->next] executionDescriptor:nil];
+            id<MTLComputePipelineState> mask_pipeline = runtime->target_dtypes[0] == MPSDataTypeFloat16
+                ? context->mask_f16_pipeline : context->mask_f32_pipeline;
+            encode_pixels(command, mask_pipeline, runtime->alpha_buffer, runtime->mask_buffer,
+                          runtime->invalid_buffer, static_cast<uint32_t>(count));
+            [command commit];
+            NSError *command_error = [command waitForExecution];
+            if (command_error != nil) fail(std::string("RVM Metal command failed: ") + [[command_error localizedDescription] UTF8String]);
+            if (*static_cast<uint32_t *>([runtime->invalid_buffer contents]) != 0) {
+                fail("RVM Metal alpha output contained a non-finite value");
             }
-
-            NSMutableDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results = [NSMutableDictionary dictionaryWithCapacity:5];
-            std::array<id<MTLBuffer>, 5> result_buffers = {};
-            for (size_t i = 0; i < runtime->targets.size(); ++i) {
-                const size_t byte_len = element_count(runtime->target_shapes[i]) * mps_dtype_size(runtime->target_dtypes[i]);
-                result_buffers[i] = [context->device newBufferWithLength:byte_len options:MTLResourceStorageModeShared];
-                if (result_buffers[i] == nil) {
-                    fail("failed to allocate RVM Metal output buffer");
-                }
-                MPSGraphTensorData *output_data = [[[MPSGraphTensorData alloc] initWithMTLBuffer:result_buffers[i]
-                                                                                           shape:make_shape(runtime->target_shapes[i])
-                                                                                        dataType:runtime->target_dtypes[i]] autorelease];
-                [results setObject:output_data forKey:runtime->targets[i]];
-            }
-
-            [runtime->graph runWithMTLCommandQueue:context->command_queue
-                                             feeds:feeds
-                                  targetOperations:nil
-                                 resultsDictionary:results];
-
-            copy_alpha_to_f32(
-                [result_buffers[0] contents],
-                runtime->target_dtypes[0],
-                expected_alpha,
-                alpha_nchw);
-
-            for (size_t i = 0; i < 4; ++i) {
-                [runtime->recurrent_buffers[i] release];
-                runtime->recurrent_buffers[i] = result_buffers[i + 1];
-                result_buffers[i + 1] = nil;
-            }
-
-            [result_buffers[0] release];
-            [input_buffer release];
+            std::memcpy(mask, [runtime->mask_buffer contents], mask_len);
+            runtime->next ^= 1;
             return 0;
         } catch (const std::exception &ex) {
             set_error(error, error_len, ex.what());

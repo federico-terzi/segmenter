@@ -16,13 +16,14 @@ SegmenterRvmMetalContext *segmenter_rvm_metal_create(
 
 int segmenter_rvm_metal_run(
     SegmenterRvmMetalContext *context,
-    const float *input_nchw,
+    const uint8_t *bgra,
     size_t input_len,
     uint32_t width,
     uint32_t height,
+    uint32_t bytes_per_row,
     float downsample_ratio,
-    float *alpha_nchw,
-    size_t alpha_len,
+    uint8_t *mask,
+    size_t mask_len,
     char *error,
     size_t error_len);
 
