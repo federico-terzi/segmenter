@@ -2,6 +2,7 @@ mod decoder;
 mod encoder;
 mod engine;
 mod frame;
+mod processing;
 
 use std::{
     path::{Path, PathBuf},
@@ -36,6 +37,16 @@ struct Args {
 
     #[arg(long, default_value_t = 0.25)]
     downsample_ratio: f32,
+
+    /// Overlap decoding and encoding with inference (Windows: on, macOS: off).
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = cfg!(target_os = "windows")
+    )]
+    pipeline: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -66,21 +77,6 @@ fn main() -> anyhow::Result<()> {
     );
     eprintln!("INFO: Writing output file \"{}\"", args.output.display());
 
-    let mut decoder = open_video_decoder(
-        &args.input,
-        DecodeOptions {
-            max_dimension: args.max_dimension,
-        },
-    )
-    .with_context(|| format!("failed to open video decoder for {}", args.input.display()))?;
-    let duration = decoder.duration();
-    let mut encoder = create_video_encoder(&args.output).with_context(|| {
-        format!(
-            "failed to create video encoder for {}",
-            args.output.display()
-        )
-    })?;
-    encoder.set_expected_duration(duration)?;
     let mut engine = create_engine(EngineOptions {
         model_path: args.model_path.clone(),
         downsample_ratio: args.downsample_ratio,
@@ -92,24 +88,44 @@ fn main() -> anyhow::Result<()> {
         )
     })?;
 
-    let mut progress = ProgressReporter::new(duration);
-    progress.emit_initial(0);
-
-    let mut frames = 0u64;
-    while let Some(frame) = decoder.read_frame()? {
-        let frame_time = frame.time;
-        let mask = engine.segment(&frame)?;
-        encoder.send_frame(&mask)?;
-        frames += 1;
-        progress.maybe_emit(frame_time, frames);
-    }
-
-    if frames == 0 {
-        bail!("input video did not produce any frames");
-    }
-
+    let mode = if args.pipeline {
+        processing::Mode::Pipelined
+    } else {
+        processing::Mode::Sequential
+    };
+    eprintln!("INFO: Processing mode: {mode:?}");
+    let mut progress = ProgressReporter::new(None);
+    let frames = processing::run(
+        mode,
+        || {
+            open_video_decoder(
+                &args.input,
+                DecodeOptions {
+                    max_dimension: args.max_dimension,
+                },
+            )
+            .with_context(|| format!("failed to open video decoder for {}", args.input.display()))
+        },
+        || {
+            create_video_encoder(&args.output).with_context(|| {
+                format!(
+                    "failed to create video encoder for {}",
+                    args.output.display()
+                )
+            })
+        },
+        engine.as_mut(),
+        |event| match event {
+            processing::Progress::Started(duration) => {
+                progress = ProgressReporter::new(duration);
+                progress.emit_initial(0);
+            }
+            processing::Progress::Frame(time, frames) => {
+                progress.maybe_emit(time, frames);
+            }
+        },
+    )?;
     progress.emit_final(frames);
-    encoder.finalize()?;
     eprintln!("DONE");
     Ok(())
 }
@@ -202,4 +218,44 @@ impl ProgressReporter {
 
 fn same_displayed_time(current: Option<f64>, target: f64) -> bool {
     current.is_some_and(|current| (current - target).abs() < 0.005)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(
+            [
+                "segmenter",
+                "--input",
+                "input.mp4",
+                "--output",
+                "output.mp4",
+                "--model-path",
+                "model.onnx",
+            ]
+            .into_iter()
+            .chain(extra.iter().copied()),
+        )
+    }
+
+    #[test]
+    fn pipeline_defaults_to_windows_only() {
+        assert_eq!(parse(&[]).unwrap().pipeline, cfg!(target_os = "windows"));
+    }
+
+    #[test]
+    fn pipeline_flag_accepts_bare_and_explicit_boolean_values() {
+        for (flags, expected) in [
+            (vec!["--pipeline"], true),
+            (vec!["--pipeline", "true"], true),
+            (vec!["--pipeline", "false"], false),
+            (vec!["--pipeline=true"], true),
+            (vec!["--pipeline=false"], false),
+        ] {
+            assert_eq!(parse(&flags).unwrap().pipeline, expected);
+        }
+        assert!(parse(&["--pipeline=invalid"]).is_err());
+    }
 }
