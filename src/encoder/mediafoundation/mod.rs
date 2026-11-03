@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     mem::ManuallyDrop,
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
@@ -130,8 +131,7 @@ impl MediaFoundationEncoder {
                 .max(frame.width.saturating_mul(frame.height).saturating_mul(4))
         };
 
-        let mut path_wide: Vec<u16> = self.output.to_string_lossy().encode_utf16().collect();
-        path_wide.push(0);
+        let path_wide: Vec<u16> = self.output.as_os_str().encode_wide().chain(Some(0)).collect();
 
         let sink_writer =
             unsafe { MFCreateSinkWriterFromURL(PCWSTR(path_wide.as_ptr()), None, None) }

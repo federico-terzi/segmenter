@@ -1,17 +1,20 @@
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    os::windows::ffi::OsStrExt,
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{bail, Context};
 use windows::{
-    core::{Interface, GUID, PWSTR},
+    core::{Interface, GUID, PCWSTR},
     Win32::{
         Media::MediaFoundation::{
             IMF2DBuffer, IMF2DBuffer2, IMFAttributes, IMFMediaType, IMFSample, IMFSourceReader,
-            MF2DBuffer_LockFlags_Read, MFCreateAttributes, MFCreateMediaType,
-            MFCreateSourceReaderFromURL, MFGetStrideForBitmapInfoHeader, MFMediaType_Video,
+            MF2DBuffer_LockFlags_Read, MFCreateAttributes, MFCreateFile, MFCreateMediaType,
+            MFCreateSourceReaderFromByteStream, MFCreateSourceReaderFromURL,
+            MFGetStrideForBitmapInfoHeader, MFMediaType_Video, MF_ACCESSMODE_READ,
+            MF_FILEFLAGS_NONE, MF_OPENMODE_FAIL_IF_NOT_EXIST,
             MFShutdown, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_NOSOCKET, MF_API_VERSION,
             MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
             MF_MT_VIDEO_ROTATION, MF_PD_DURATION, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
@@ -122,8 +125,7 @@ impl MediaFoundationDecoder {
             self.mf_started = true;
         }
 
-        let mut path_wide: Vec<u16> = input.to_string_lossy().encode_utf16().collect();
-        path_wide.push(0);
+        let path_wide: Vec<u16> = input.as_os_str().encode_wide().chain(Some(0)).collect();
 
         let attributes = unsafe {
             let mut attributes: Option<IMFAttributes> = None;
@@ -137,10 +139,27 @@ impl MediaFoundationDecoder {
             attributes
         };
 
-        self.source_reader = Some(unsafe {
-            MFCreateSourceReaderFromURL(PWSTR(path_wide.as_mut_ptr()), &attributes)
-                .context("failed to create Media Foundation source reader")?
-        });
+        // The URL resolver rejects verbatim paths produced by canonicalization.
+        // Open the file directly to preserve long paths and verbatim filename semantics.
+        let source_reader = if matches!(
+            input.components().next(),
+            Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+        ) {
+            let byte_stream = unsafe {
+                MFCreateFile(
+                    MF_ACCESSMODE_READ,
+                    MF_OPENMODE_FAIL_IF_NOT_EXIST,
+                    MF_FILEFLAGS_NONE,
+                    PCWSTR(path_wide.as_ptr()),
+                )
+            }
+            .context("failed to open Media Foundation input file")?;
+            unsafe { MFCreateSourceReaderFromByteStream(&byte_stream, &attributes) }
+        } else {
+            unsafe { MFCreateSourceReaderFromURL(PCWSTR(path_wide.as_ptr()), &attributes) }
+        }
+        .context("failed to create Media Foundation source reader")?;
+        self.source_reader = Some(source_reader);
         let source_reader = self
             .source_reader
             .as_ref()
