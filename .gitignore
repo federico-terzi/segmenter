@@ -24,3 +24,8 @@ rustc-ice-*.txt
 #.idea/
 
 .DS_Store
+
+# Local RVM research inputs and diagnostic reports; do not publish these.
+/*.onnx
+/*.rvmmetal
+/resize_3_failure_report.md

@@ -73,5 +73,45 @@ fn cc_config() {
 fn cc_config() {}
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
     cc_config();
+    #[cfg(target_os = "windows")]
+    if std::env::var_os("CARGO_FEATURE_RESEARCH_NCNN").is_some() {
+        println!("cargo:rerun-if-changed=src/engine/onnx/ncnn_probe.cpp");
+        println!("cargo:rerun-if-env-changed=SEGMENTER_NCNN_SDK");
+        let root = std::env::var("SEGMENTER_NCNN_SDK")
+            .unwrap_or_else(|_| "target/rvm-ncnn-sdk/ncnn-20260526-windows-vs2022/x64".into());
+        cc::Build::new()
+            .cpp(true)
+            .flag("/std:c++17")
+            .flag("/EHsc")
+            .include(format!("{root}/include/ncnn"))
+            .file("src/engine/onnx/ncnn_probe.cpp")
+            .compile("rvm_ncnn_probe");
+        println!("cargo:rustc-link-search=native={root}/lib");
+        for lib in [
+            "ncnn",
+            "glslang",
+            "MachineIndependent",
+            "GenericCodeGen",
+            "OSDependent",
+            "SPIRV",
+            "glslang-default-resource-limits",
+        ] {
+            println!("cargo:rustc-link-lib=static={lib}");
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if std::env::var_os("CARGO_FEATURE_RESEARCH_DX12").is_some() {
+        println!("cargo:rerun-if-changed=src/engine/onnx/dx12_probe.cpp");
+        cc::Build::new()
+            .cpp(true)
+            .flag("/std:c++17")
+            .flag("/EHsc")
+            .file("src/engine/onnx/dx12_probe.cpp")
+            .compile("rvm_dx12_probe");
+        println!("cargo:rustc-link-lib=d3d12");
+        println!("cargo:rustc-link-lib=dxgi");
+        println!("cargo:rustc-link-lib=DirectML");
+    }
 }

@@ -10,6 +10,8 @@ default = ["engine-metal", "windows-default-onnx"]
 engine-metal = []
 engine-onnx = ["dep:half", "dep:ndarray", "dep:ort"]
 windows-default-onnx = []
+research-dx12 = []
+research-ncnn = []
 
 [dependencies]
 anyhow = "1.0.86"

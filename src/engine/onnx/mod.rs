@@ -1,7 +1,15 @@
+mod alpha_gather;
+#[cfg(test)]
+mod benchmark;
 mod constants;
+#[cfg(all(test, target_os = "windows", feature = "research-dx12"))]
+mod dx12_probe;
 mod model_patch;
+#[cfg(all(test, target_os = "windows", feature = "research-ncnn"))]
+mod ncnn_probe;
 mod proto;
 mod session;
+mod specialize;
 mod tensor;
 
 use std::{fs, path::PathBuf};
@@ -94,6 +102,30 @@ impl OnnxEngine {
         self.downsample_ratio =
             Tensor::from_array(([1], vec![prepared.effective_downsample_ratio]))?;
 
+        if cfg!(target_os = "windows")
+            && std::env::var_os("SEGMENTER_DISABLE_SPECIALIZATION").is_none()
+        {
+            let bytes = match &prepared.source {
+                PreparedModelSource::OriginalFile => &original_model_bytes,
+                PreparedModelSource::Bytes(bytes) => bytes,
+            };
+            match self.build_static_session(
+                bytes,
+                width,
+                height,
+                prepared.effective_downsample_ratio,
+            ) {
+                Ok(state) => {
+                    self.state = Some(state);
+                    eprintln!("INFO: Specialized ONNX input shapes and downsample ratio");
+                    return Ok(());
+                }
+                Err(error) => eprintln!(
+                    "INFO: ONNX shape specialization unavailable; using dynamic session: {error:#}"
+                ),
+            }
+        }
+
         let state = match self.build_prepared_session(&prepared, width, height) {
             Ok(state) => state,
             Err(primary_error) if should_patch_identity_resize(self.requested_downsample_ratio) => {
@@ -130,6 +162,73 @@ impl OnnxEngine {
         Ok(())
     }
 
+    fn build_static_session(
+        &self,
+        model: &[u8],
+        width: u32,
+        height: u32,
+        ratio: f32,
+    ) -> anyhow::Result<OnnxSessionState> {
+        // Resolve recurrent output sizes from ORT's shape inference using the
+        // same broadcast-zero inputs as the original first frame. No inference
+        // or guessed architecture-specific channel counts are needed.
+        let mut shapes = vec![(SRC_INPUT, vec![1, 3, i64::from(height), i64::from(width)])];
+        shapes.extend([R1_INPUT, R2_INPUT, R3_INPUT, R4_INPUT].map(|n| (n, vec![1; 4])));
+        let bootstrap = specialize::specialize(model, &shapes, ratio)?;
+        let session = ort::session::Session::builder()?
+            .with_intra_threads(1)?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level1)?
+            .commit_from_memory(&bootstrap)?;
+        for (i, name) in [R1_OUTPUT, R2_OUTPUT, R3_OUTPUT, R4_OUTPUT]
+            .into_iter()
+            .enumerate()
+        {
+            let output = session
+                .outputs
+                .iter()
+                .find(|v| v.name == name)
+                .context("missing recurrent output")?;
+            match &output.output_type {
+                ort::value::ValueType::Tensor { shape, .. }
+                    if shape.len() == 4 && shape.iter().all(|d| *d > 0) =>
+                {
+                    shapes[i + 1].1 = shape.to_vec()
+                }
+                _ => bail!("could not resolve fixed shape of {name}"),
+            }
+        }
+        drop(session);
+        let bytes = specialize::specialize(model, &shapes, ratio)?;
+        match build_session_state(
+            ModelSource::Memory(&bytes),
+            &self.model_path,
+            width,
+            height,
+            false,
+        ) {
+            Ok(state) => Ok(state),
+            Err(primary_error) => {
+                // Some DirectML drivers cannot compile the final
+                // one-channel Split output. Gather selects the same channel
+                // and preserves its dimension. Only retry on compilation
+                // failure: the original layout may be faster on other GPUs.
+                let retry = alpha_gather::rewrite_model(&bytes)?;
+                if retry == bytes {
+                    return Err(primary_error);
+                }
+                eprintln!("INFO: Specialized DirectML session failed; retrying equivalent alpha Gather: {primary_error:#}");
+                build_session_state(
+                    ModelSource::Memory(&retry),
+                    &self.model_path,
+                    width,
+                    height,
+                    false,
+                )
+                .context("specialized alpha Gather retry failed")
+            }
+        }
+    }
+
     fn build_prepared_session(
         &self,
         prepared: &PreparedModel,
@@ -163,7 +262,6 @@ impl Engine for OnnxEngine {
             .as_mut()
             .context("RVM ONNX session was not initialized")?;
         let precision = state.precision;
-
         // BindInput may copy CPU data immediately. Clear the old bindings before
         // filling the reusable tensor, then rebind it on every frame.
         state.binding.clear_inputs();

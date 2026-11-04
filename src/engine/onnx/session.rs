@@ -46,12 +46,18 @@ pub(super) fn build_session_state(
 ) -> anyhow::Result<OnnxSessionState> {
     let builder = Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_execution_providers(execution_providers())?
         .with_parallel_execution(false)?
         .with_memory_pattern(false)?;
     #[cfg(target_os = "windows")]
     let builder = builder.with_intra_op_spinning(false)?;
+    #[cfg(test)]
+    let builder = if let Some(path) = std::env::var_os("SEGMENTER_BENCH_PROFILE") {
+        builder.with_profiling(std::path::PathBuf::from(path))?
+    } else {
+        builder
+    };
 
+    let builder = builder.with_execution_providers(execution_providers())?;
     let session = match source {
         ModelSource::File(path) => builder.commit_from_file(path),
         ModelSource::Memory(bytes) => builder.commit_from_memory(bytes),
@@ -60,7 +66,7 @@ pub(super) fn build_session_state(
 
     validate_io_names(&session, uses_downsample_ratio)?;
     let precision = model_precision(&session)?;
-    let recurrent = initial_recurrent_states(precision)?;
+    let recurrent = initial_recurrent_states(precision, &session)?;
     let shape = [1, 3, height as usize, width as usize];
     let len = (width as usize)
         .checked_mul(height as usize)
@@ -143,18 +149,33 @@ pub(super) fn take_recurrent_outputs(
     Ok(recurrent)
 }
 
-fn initial_recurrent_states(precision: RvmPrecision) -> anyhow::Result<Vec<DynTensor>> {
+pub(super) fn initial_recurrent_states(
+    precision: RvmPrecision,
+    session: &Session,
+) -> anyhow::Result<Vec<DynTensor>> {
     let mut recurrent = Vec::with_capacity(4);
-    for _ in 0..4 {
+    for name in [R1_INPUT, R2_INPUT, R3_INPUT, R4_INPUT] {
+        let input = session
+            .inputs
+            .iter()
+            .find(|v| v.name == name)
+            .context("missing recurrent input")?;
+        let shape = match &input.input_type {
+            ValueType::Tensor { shape, .. } if shape.len() == 4 && shape.iter().all(|d| *d > 0) => {
+                shape.iter().map(|d| *d as usize).collect::<Vec<_>>()
+            }
+            _ => RECURRENT_STATE_SHAPE.to_vec(),
+        };
+        let len = shape
+            .iter()
+            .try_fold(1usize, |n, d| n.checked_mul(*d))
+            .context("recurrent tensor size overflowed")?;
         recurrent.push(match precision {
-            RvmPrecision::Float16 => Tensor::from_array((
-                RECURRENT_STATE_SHAPE,
-                vec![f16::from_f32(0.0)].into_boxed_slice(),
-            ))?
-            .upcast(),
+            RvmPrecision::Float16 => {
+                Tensor::from_array((shape, vec![f16::ZERO; len].into_boxed_slice()))?.upcast()
+            }
             RvmPrecision::Float32 => {
-                Tensor::from_array((RECURRENT_STATE_SHAPE, vec![0.0_f32].into_boxed_slice()))?
-                    .upcast()
+                Tensor::from_array((shape, vec![0.0_f32; len].into_boxed_slice()))?.upcast()
             }
         });
     }
@@ -218,8 +239,17 @@ fn tensor_type(value_type: &ValueType) -> Option<TensorElementType> {
 
 #[cfg(target_os = "windows")]
 fn execution_providers() -> Vec<ExecutionProviderDispatch> {
+    #[cfg(test)]
+    let device = std::env::var("SEGMENTER_BENCH_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    #[cfg(not(test))]
+    let device = 0;
     vec![
-        DirectMLExecutionProvider::default().build(),
+        DirectMLExecutionProvider::default()
+            .with_device_id(device)
+            .build(),
         CPUExecutionProvider::default().build(),
     ]
 }
