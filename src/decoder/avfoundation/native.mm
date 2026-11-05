@@ -74,6 +74,13 @@ uint32_t segd_get_asset_rotation(void *asset, int32_t *rotation) {
   return SEGD_SUCCESS;
 }
 
+double segd_get_nominal_frame_rate(void *asset) {
+  if (!asset) return 0;
+  AVAssetTrack *track = [[(AVAsset *)asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+  const double rate = track.nominalFrameRate;
+  return isfinite(rate) && rate > 0 ? rate : 0;
+}
+
 void *segd_initialize_asset_reader(const SEGDecodeOptions *options,
                                    void *asset,
                                    int32_t *error_code) {
@@ -153,6 +160,11 @@ void *segd_initialize_video_track_output(const SEGDecodeOptions *options,
         (id)kCVPixelBufferWidthKey : @(output_width),
         (id)kCVPixelBufferHeightKey : @(output_height)
       }];
+
+  if (options->native_buffers) {
+    output_settings[(id)kCVPixelBufferIOSurfacePropertiesKey] = @{};
+    output_settings[(id)kCVPixelBufferMetalCompatibilityKey] = @YES;
+  }
 
   NSOperatingSystemVersion version =
       [[NSProcessInfo processInfo] operatingSystemVersion];
@@ -263,4 +275,15 @@ void segd_release_sample(const SEGDecodedSample *sample) {
   if (sample_buffer) {
     CFRelease(sample_buffer);
   }
+}
+
+void *segd_retain_pixel_buffer(const SEGDecodedSample *sample) {
+  CVPixelBufferRef buffer = CMSampleBufferGetImageBuffer((CMSampleBufferRef)sample->sample_buffer);
+  if (!buffer || CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return nullptr;
+  return CVPixelBufferRetain(buffer);
+}
+void segd_release_pixel_buffer(void *pixel_buffer) {
+  CVPixelBufferRef buffer = (CVPixelBufferRef)pixel_buffer;
+  CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+  CVPixelBufferRelease(buffer);
 }

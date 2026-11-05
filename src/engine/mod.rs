@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{bail, Context};
 
-use crate::frame::VideoFrame;
+use crate::frame::{VideoFrame, VideoFrameInfo};
 
 #[cfg(any(
     all(target_os = "macos", feature = "engine-onnx"),
@@ -21,7 +21,24 @@ mod onnx;
 mod metal;
 
 pub trait Engine {
+    /// Predict the output layout only when it is guaranteed for this input.
+    /// Allows the encoder to initialize concurrently with first-frame inference.
+    fn output_frame_info(&self, _input: &VideoFrame) -> Option<VideoFrameInfo> {
+        None
+    }
+
     fn segment(&mut self, frame: &VideoFrame) -> anyhow::Result<VideoFrame>;
+
+    /// Queue a frame, optionally returning the oldest completed mask.
+    /// Synchronous engines retain their original per-frame behavior.
+    fn enqueue(&mut self, frame: &VideoFrame) -> anyhow::Result<Option<VideoFrame>> {
+        self.segment(frame).map(Some)
+    }
+
+    /// Return pending masks in presentation order at end of input.
+    fn drain(&mut self) -> anyhow::Result<Option<VideoFrame>> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone)]

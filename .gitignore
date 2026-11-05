@@ -24,3 +24,10 @@ rustc-ice-*.txt
 #.idea/
 
 .DS_Store
+
+# Local inputs, model weights, exports, and profiling captures.
+/*.mov
+/*.mp4
+/*.onnx
+/*.rvmmetal
+/profile*.json*

@@ -18,8 +18,8 @@ use native::{
 use objc::rc::autoreleasepool;
 
 use crate::{
-    encoder::VideoEncoder,
-    frame::{PixelFormat, VideoFrame},
+    encoder::{EncodeOptions, VideoEncoder},
+    frame::{PixelFormat, VideoFrame, VideoFrameInfo},
 };
 
 pub struct AvFoundationEncoder {
@@ -27,10 +27,12 @@ pub struct AvFoundationEncoder {
     input: Option<Arc<AvAssetWriterInput>>,
     output: PathBuf,
     finalized: bool,
+    options: EncodeOptions,
+    expected_frame_rate: Option<f64>,
 }
 
 impl AvFoundationEncoder {
-    pub fn new(output: &Path) -> anyhow::Result<Self> {
+    pub fn new(output: &Path, options: EncodeOptions) -> anyhow::Result<Self> {
         if output.exists() {
             std::fs::remove_file(output).with_context(|| {
                 format!("failed to remove existing output {}", output.display())
@@ -42,14 +44,20 @@ impl AvFoundationEncoder {
             input: None,
             output: output.to_path_buf(),
             finalized: false,
+            options,
+            expected_frame_rate: None,
         })
     }
 
-    fn initialize(&mut self, frame: &VideoFrame) -> anyhow::Result<()> {
+    fn initialize(&mut self, frame: VideoFrameInfo) -> anyhow::Result<()> {
         let input = Arc::new(AvAssetWriterInput::new(
             self.writer.clone(),
             frame.width,
             frame.height,
+            frame.grayscale_mask,
+            frame.time.timescale,
+            self.options.h264_fast,
+            self.expected_frame_rate,
         )?);
         self.writer.start(frame.time)?;
         self.input = Some(input);
@@ -58,6 +66,26 @@ impl AvFoundationEncoder {
 }
 
 impl VideoEncoder for AvFoundationEncoder {
+    fn set_expected_frame_rate(&mut self, rate: Option<f64>) -> anyhow::Result<()> {
+        if self.finalized || self.input.is_some() {
+            bail!("expected frame rate must be set before encoder preparation");
+        }
+        self.expected_frame_rate = rate.filter(|rate| rate.is_finite() && *rate > 0.0);
+        Ok(())
+    }
+
+    fn prepare(&mut self, info: VideoFrameInfo) -> anyhow::Result<()> {
+        autoreleasepool(|| {
+            if self.finalized || self.input.is_some() {
+                bail!("encoder preparation must precede the first frame");
+            }
+            if info.format != PixelFormat::Bgra {
+                bail!("AVFoundation encoder only accepts BGRA frames");
+            }
+            self.initialize(info)
+        })
+    }
+
     fn send_frame(&mut self, frame: &VideoFrame) -> anyhow::Result<()> {
         autoreleasepool(|| {
             if self.finalized {
@@ -67,7 +95,7 @@ impl VideoEncoder for AvFoundationEncoder {
                 bail!("AVFoundation encoder only accepts BGRA frames");
             }
             if self.input.is_none() {
-                self.initialize(frame)?;
+                self.initialize(frame.info())?;
             }
 
             let input = self
@@ -82,6 +110,9 @@ impl VideoEncoder for AvFoundationEncoder {
                     frame.width,
                     frame.height
                 );
+            }
+            if input.grayscale_mask != frame.grayscale_mask {
+                bail!("encoded frames must preserve the grayscale mask format");
             }
             input.send_frame(frame)
         })
@@ -196,16 +227,29 @@ struct AvAssetWriterInput {
     writer: Arc<AvAssetWriter>,
     width: u32,
     height: u32,
+    grayscale_mask: bool,
     _options: Arc<SEGEncodeWriterInputOptions>,
 }
 
 impl AvAssetWriterInput {
-    fn new(writer: Arc<AvAssetWriter>, width: u32, height: u32) -> anyhow::Result<Self> {
+    fn new(
+        writer: Arc<AvAssetWriter>,
+        width: u32,
+        height: u32,
+        grayscale_mask: bool,
+        source_timescale: i32,
+        fast_h264: bool,
+        expected_frame_rate: Option<f64>,
+    ) -> anyhow::Result<Self> {
         let options = Arc::new(SEGEncodeWriterInputOptions {
             asset_writer: writer.ptr,
             video_codec: SEGE_VIDEO_CODEC_H264,
             video_width: width,
             video_height: height,
+            grayscale_mask: u32::from(grayscale_mask),
+            source_timescale,
+            fast_h264: u32::from(fast_h264),
+            expected_frame_rate: expected_frame_rate.unwrap_or(0.0),
         });
         let mut error_code = 0;
         let ptr = unsafe { sege_initialize_asset_writer_input(options.as_ref(), &mut error_code) };
@@ -218,6 +262,7 @@ impl AvAssetWriterInput {
             writer,
             width,
             height,
+            grayscale_mask,
             _options: options,
         })
     }

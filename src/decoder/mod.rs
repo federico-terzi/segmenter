@@ -8,11 +8,18 @@ pub trait VideoDecoder {
     fn duration(&self) -> Option<MediaTime> {
         None
     }
+
+    /// Encoder initialization hint; individual frame timestamps remain authoritative.
+    fn nominal_frame_rate(&self) -> Option<f64> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeOptions {
     pub max_dimension: Option<u32>,
+    #[cfg(target_os = "macos")]
+    pub native_buffers: bool,
 }
 
 #[cfg(target_os = "macos")]

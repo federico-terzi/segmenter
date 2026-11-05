@@ -1,0 +1,229 @@
+{
+  "scope": "Native macOS Metal RVM optimization and Windows-compatible H.264 export",
+  "measurement_date": "2026-11-04",
+  "base_commit": "8e3554a",
+  "platform": {
+    "chip": "Apple M5 Max",
+    "os": "macOS 26.4"
+  },
+  "model": {
+    "architecture": "RVM MobileNetV3",
+    "weights": "unchanged FP16",
+    "downsample_ratio": 0.25
+  },
+  "methods": {
+    "inference": "Five alternating warmed trials on predecoded clips repeated five times. First ten output frames excluded. Includes normalization, inference and mask conversion; excludes decoding, encoding and compilation.",
+    "whole_export": "Five alternating warmed trials against original binary. Includes process startup, decoding, inference, encoding and finalization.",
+    "fast_h264": "Five alternating warmed trials on clip A, nine on clip B, against preceding optimized pipeline with original compression. Same model, ratio and resolution.",
+    "fps_hint": "Nine alternating warmed full-export trials per clip; seven alternating isolated encoder trials. FPS hint varied independently of sample timestamps.",
+    "quality": "All 489 frames and exact source timestamps checked. Compression quality uses video-range luma against uncompressed masks. Enlarged edge composites inspected locally."
+  },
+  "selected_encoder": {
+    "codec": "H.264",
+    "profile": "High AutoLevel",
+    "bit_depth": 8,
+    "chroma": "4:2:0",
+    "b_frames": false,
+    "quality": 0.83,
+    "expected_fps": "finite positive source nominal frame rate when available",
+    "scope": "macOS native Metal",
+    "restore_previous_compression": "--h264-fast=false"
+  },
+  "clips": [
+    {
+      "id": "clip_a",
+      "dimensions": [
+        1920,
+        1080
+      ],
+      "frames": 337,
+      "timing_description": "60 fps constant",
+      "inference": {
+        "baseline_median_fps": 399.387,
+        "candidate_median_fps": 1061.6,
+        "speedup": 2.6580734976351255
+      },
+      "whole_export_vs_original": {
+        "baseline_median_seconds": 1.5819171670000003,
+        "candidate_median_seconds": 0.8443914170000002,
+        "speedup": 1.8734406048563612
+      },
+      "fast_h264_vs_preceding_optimized": {
+        "baseline_median_seconds": 0.9407693749999986,
+        "candidate_median_seconds": 0.8123177080000001,
+        "speedup": 1.1581298372975988,
+        "trials_per_variant": 5,
+        "file_size": {
+          "baseline_bytes": 2267512,
+          "candidate_bytes": 2263153,
+          "percentage_change": -0.19223713038784007,
+          "within_five_percent": true
+        }
+      },
+      "fps_hint_vs_no_hint": {
+        "baseline_median_seconds": 0.8044939590000002,
+        "candidate_median_seconds": 0.8059963329999995,
+        "speedup": 0.9981360039264604,
+        "trials_per_variant": 9,
+        "isolated_encoder_ms": {
+          "without_hint": 696.698,
+          "with_hint": 696.698
+        },
+        "decoded_pixels_identical": true,
+        "file_size_identical": true,
+        "legacy_size_and_pixels_identical": true
+      },
+      "compression_quality_against_uncompressed_masks": {
+        "previous": {
+          "frames": 337,
+          "pixels": 698803200,
+          "exact_luma": false,
+          "maximum_luma_error": 39,
+          "mean_luma_error": 0.014954133,
+          "mean_edge_luma_error": 1.279163292,
+          "neutral_chroma": true,
+          "timestamps_checked": true,
+          "psnr_db": 62.269792
+        },
+        "current": {
+          "frames": 337,
+          "pixels": 698803200,
+          "exact_luma": false,
+          "maximum_luma_error": 35,
+          "mean_luma_error": 0.015855913,
+          "mean_edge_luma_error": 1.27547224,
+          "neutral_chroma": true,
+          "timestamps_checked": true,
+          "psnr_db": 63.104318
+        }
+      },
+      "final_stream": {
+        "codec_name": "h264",
+        "profile": "High",
+        "codec_tag_string": "avc1",
+        "width": 1920,
+        "height": 1080,
+        "has_b_frames": 0,
+        "pix_fmt": "yuv420p",
+        "level": 42,
+        "time_base": "1/600",
+        "nb_frames": "337"
+      }
+    },
+    {
+      "id": "clip_b",
+      "dimensions": [
+        640,
+        480
+      ],
+      "frames": 152,
+      "timing_description": "approximately 30 fps variable",
+      "inference": {
+        "baseline_median_fps": 646.746,
+        "candidate_median_fps": 3365.197,
+        "speedup": 5.203274546730865
+      },
+      "whole_export_vs_original": {
+        "baseline_median_seconds": 0.5615124999999992,
+        "candidate_median_seconds": 0.28345329199999725,
+        "speedup": 1.9809701134111528
+      },
+      "fast_h264_vs_preceding_optimized": {
+        "baseline_median_seconds": 0.29933212500000006,
+        "candidate_median_seconds": 0.2691863330000004,
+        "speedup": 1.1119885681566144,
+        "trials_per_variant": 9,
+        "file_size": {
+          "baseline_bytes": 527977,
+          "candidate_bytes": 532157,
+          "percentage_change": 0.7917011536487495,
+          "within_five_percent": true
+        }
+      },
+      "fps_hint_vs_no_hint": {
+        "baseline_median_seconds": 0.2637648330000033,
+        "candidate_median_seconds": 0.2633142500000005,
+        "speedup": 1.001711198691308,
+        "trials_per_variant": 9,
+        "isolated_encoder_ms": {
+          "without_hint": 150.471,
+          "with_hint": 151.239
+        },
+        "decoded_pixels_identical": true,
+        "file_size_identical": true,
+        "legacy_size_and_pixels_identical": true
+      },
+      "compression_quality_against_uncompressed_masks": {
+        "previous": {
+          "frames": 152,
+          "pixels": 46694400,
+          "exact_luma": false,
+          "maximum_luma_error": 56,
+          "mean_luma_error": 0.044145508,
+          "mean_edge_luma_error": 1.399954808,
+          "neutral_chroma": true,
+          "timestamps_checked": true,
+          "psnr_db": 57.477543
+        },
+        "current": {
+          "frames": 152,
+          "pixels": 46694400,
+          "exact_luma": false,
+          "maximum_luma_error": 56,
+          "mean_luma_error": 0.045724091,
+          "mean_edge_luma_error": 1.342512126,
+          "neutral_chroma": true,
+          "timestamps_checked": true,
+          "psnr_db": 58.143343
+        }
+      },
+      "final_stream": {
+        "codec_name": "h264",
+        "profile": "High",
+        "codec_tag_string": "avc1",
+        "width": 640,
+        "height": 480,
+        "has_b_frames": 0,
+        "pix_fmt": "yuv420p",
+        "level": 30,
+        "time_base": "1/15360",
+        "nb_frames": "152"
+      }
+    }
+  ],
+  "interpretation": {
+    "minimum_3x_whole_export_target_met": false,
+    "fps_hint_measurable_speedup": false,
+    "fps_hint_retained_for": "Correct automatic H.264 level selection. Clip A now declares level 4.2 for 1080p60, instead of level 4.0.",
+    "quality": "Visually unchanged in inspected composites. Small inference floating-point differences remain; H.264 is lossy relative to raw masks. Compression PSNR and mean edge error improve slightly on both test clips.",
+    "size_limit": "Both supplied clips stay within 5% of preceding output size. Constant quality does not enforce a universal byte-size cap.",
+    "timing_limit": "Short clips and warmed caches; results depend on hardware, OS encoder and content. Inference throughput is distinct from full-export throughput.",
+    "rejected_experiments": [
+      "Larger queues, earlier conversion, startup overlap, zero-copy BGRA wrapping and readiness callbacks produced no useful stable full-export gain.",
+      "Parallel encoding improved an isolated long encoder test by 21%, but complete segmented exports lost the advantage to buffering, startup and joining costs. Prototype removed.",
+      "Average-bitrate fast encoding had worse faint-edge fidelity than quality 0.83.",
+      "Adding expected FPS to legacy default compression increased isolated clip A size by 32.46%; legacy mode intentionally omits the hint."
+    ]
+  },
+  "validation": {
+    "rust_tests_passed": 54,
+    "rust_tests_failed": 0,
+    "gpu_test_separately_required": true,
+    "native_codec_checks": "MOV/MP4, fractional FPS hints, 1080p60 level selection, VFR/sub-millisecond PTS, odd/padded/general BGRA input, invalid storage and early teardown passed.",
+    "clippy": "Passed with pre-existing upper_case_acronyms and arc_with_non_send_sync exemptions.",
+    "offline_release_build": "passed",
+    "dependencies_installed_or_added": false,
+    "added_system_frameworks": [
+      "Accelerate",
+      "VideoToolbox"
+    ],
+    "onnx_inference_changed": false,
+    "windows_encoding_defaults_changed": false,
+    "actual_windows_playback_tested": false
+  },
+  "references": [
+    "https://developer.apple.com/documentation/avfoundation/avvideoexpectedsourceframeratekey",
+    "https://learn.microsoft.com/en-us/windows/win32/medfound/h-264-video-decoder"
+  ],
+  "publication": "Anonymized aggregate metrics only. No input paths, original clip names, media, masks, model weights, profiles, raw frame hashes, host identifiers, binary artifacts or local logs are included."
+}

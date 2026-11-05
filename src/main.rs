@@ -13,7 +13,7 @@ use anyhow::{bail, Context};
 use clap::Parser;
 
 use decoder::{open_video_decoder, DecodeOptions};
-use encoder::create_video_encoder;
+use encoder::{create_video_encoder, EncodeOptions};
 use engine::{create_engine, engine_label_for_model, EngineOptions};
 use frame::MediaTime;
 
@@ -38,15 +38,20 @@ struct Args {
     #[arg(long, default_value_t = 0.25)]
     downsample_ratio: f32,
 
-    /// Overlap decoding and encoding with inference (Windows: on, macOS: off).
+    /// Overlap decoding, inference and encoding (default: on for Metal and Windows).
     #[arg(
         long,
         action = clap::ArgAction::Set,
         num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = cfg!(target_os = "windows")
+        default_missing_value = "true"
     )]
-    pipeline: bool,
+    pipeline: Option<bool>,
+
+    /// Faster Windows-compatible H.264 (default: on for macOS Metal).
+    /// Use false to retain the original compression settings.
+    #[cfg(target_os = "macos")]
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    h264_fast: Option<bool>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -62,6 +67,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     let engine_label = engine_label_for_model(&args.model_path)?;
+    #[cfg(target_os = "macos")]
+    if args.h264_fast == Some(true) && engine_label != "Metal" {
+        bail!("--h264-fast is supported only by the native macOS Metal path");
+    }
+    let encode_options = EncodeOptions {
+        #[cfg(target_os = "macos")]
+        h264_fast: args.h264_fast.unwrap_or(engine_label == "Metal"),
+    };
     eprintln!(
         "INFO: Version {} Arch {}",
         env!("CARGO_PKG_VERSION"),
@@ -88,7 +101,10 @@ fn main() -> anyhow::Result<()> {
         )
     })?;
 
-    let mode = if args.pipeline {
+    let mode = if args
+        .pipeline
+        .unwrap_or(engine_label == "Metal" || cfg!(target_os = "windows"))
+    {
         processing::Mode::Pipelined
     } else {
         processing::Mode::Sequential
@@ -102,12 +118,14 @@ fn main() -> anyhow::Result<()> {
                 &args.input,
                 DecodeOptions {
                     max_dimension: args.max_dimension,
+                    #[cfg(target_os = "macos")]
+                    native_buffers: engine_label == "Metal",
                 },
             )
             .with_context(|| format!("failed to open video decoder for {}", args.input.display()))
         },
         || {
-            create_video_encoder(&args.output).with_context(|| {
+            create_video_encoder(&args.output, encode_options).with_context(|| {
                 format!(
                     "failed to create video encoder for {}",
                     args.output.display()
@@ -241,8 +259,24 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_defaults_to_windows_only() {
-        assert_eq!(parse(&[]).unwrap().pipeline, cfg!(target_os = "windows"));
+    fn pipeline_default_is_selected_after_detecting_engine() {
+        assert_eq!(parse(&[]).unwrap().pipeline, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fast_h264_can_be_disabled_without_affecting_pipeline_selection() {
+        assert_eq!(parse(&[]).unwrap().h264_fast, None);
+        for (flags, expected) in [
+            (vec!["--h264-fast"], true),
+            (vec!["--h264-fast", "true"], true),
+            (vec!["--h264-fast=false"], false),
+        ] {
+            let args = parse(&flags).unwrap();
+            assert_eq!(args.h264_fast, Some(expected));
+            assert_eq!(args.pipeline, None);
+        }
+        assert!(parse(&["--h264-fast", "maybe"]).is_err());
     }
 
     #[test]
@@ -254,7 +288,7 @@ mod tests {
             (vec!["--pipeline=true"], true),
             (vec!["--pipeline=false"], false),
         ] {
-            assert_eq!(parse(&flags).unwrap().pipeline, expected);
+            assert_eq!(parse(&flags).unwrap().pipeline, Some(expected));
         }
         assert!(parse(&["--pipeline=invalid"]).is_err());
     }

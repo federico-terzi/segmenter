@@ -38,6 +38,7 @@ typedef struct {
   char file_path[FILENAME_MAX];
   uint32_t output_video_format;
   uint32_t max_dimension;
+  uint32_t native_buffers;
 } SEGDecodeOptions;
 
 extern "C" void *segd_initialize_asset(const SEGDecodeOptions *options,
@@ -46,6 +47,8 @@ extern "C" void segd_release_asset(void *asset);
 extern "C" uint32_t segd_get_asset_duration(void *asset,
                                             SEGDecodeTime *duration);
 extern "C" uint32_t segd_get_asset_rotation(void *asset, int32_t *rotation);
+// Zero means unavailable. This is a hint, not a replacement for sample PTS.
+extern "C" double segd_get_nominal_frame_rate(void *asset);
 
 extern "C" void *segd_initialize_asset_reader(const SEGDecodeOptions *options,
                                               void *asset,
@@ -74,5 +77,8 @@ segd_initialize_video_track_output(const SEGDecodeOptions *options,
                                    void *asset_reader,
                                    int32_t *error_code);
 extern "C" void segd_release_track_output(void *video_track_output);
+
+extern "C" void *segd_retain_pixel_buffer(const SEGDecodedSample *sample);
+extern "C" void segd_release_pixel_buffer(void *pixel_buffer);
 
 #endif

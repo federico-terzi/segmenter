@@ -8,18 +8,20 @@ use std::{
 
 use anyhow::{bail, Context};
 use native::{
-    segd_get_asset_duration, segd_get_asset_rotation, segd_get_sample_data, segd_initialize_asset,
-    segd_initialize_asset_reader, segd_initialize_video_track_output, segd_lock_sample,
-    segd_read_sample, segd_release_asset, segd_release_asset_reader, segd_release_sample,
-    segd_release_track_output, segd_start_asset_reader, segd_unlock_sample, SEGDecodeOptions,
-    SEGDecodeTime, SEGDecodedSample, SEGD_NOT_FOUND_ERROR, SEGD_READ_SAMPLE_CANCELLED,
-    SEGD_READ_SAMPLE_COMPLETED, SEGD_READ_SAMPLE_FAILED, SEGD_READ_SAMPLE_NO_SAMPLE,
-    SEGD_READ_SAMPLE_SUCCESS, SEGD_READ_SAMPLE_UNKNOWN, SEGD_SUCCESS, SEGD_VIDEO_FORMAT_BGRA,
+    segd_get_asset_duration, segd_get_asset_rotation, segd_get_nominal_frame_rate,
+    segd_get_sample_data, segd_initialize_asset, segd_initialize_asset_reader,
+    segd_initialize_video_track_output, segd_lock_sample, segd_read_sample, segd_release_asset,
+    segd_release_asset_reader, segd_release_pixel_buffer, segd_release_sample,
+    segd_release_track_output, segd_retain_pixel_buffer, segd_start_asset_reader,
+    segd_unlock_sample, SEGDecodeOptions, SEGDecodeTime, SEGDecodedSample, SEGD_NOT_FOUND_ERROR,
+    SEGD_READ_SAMPLE_CANCELLED, SEGD_READ_SAMPLE_COMPLETED, SEGD_READ_SAMPLE_FAILED,
+    SEGD_READ_SAMPLE_NO_SAMPLE, SEGD_READ_SAMPLE_SUCCESS, SEGD_READ_SAMPLE_UNKNOWN, SEGD_SUCCESS,
+    SEGD_VIDEO_FORMAT_BGRA,
 };
 
 use crate::{
     decoder::{DecodeOptions, VideoDecoder},
-    frame::{DisplayRotation, MediaTime, VideoFrame},
+    frame::{DisplayRotation, FrameData, FramePool, MediaTime, VideoFrame},
 };
 
 pub struct AvFoundationDecoder {
@@ -28,6 +30,9 @@ pub struct AvFoundationDecoder {
     track_output: Arc<AvAssetReaderTrackOutput>,
     display_rotation: DisplayRotation,
     duration: Option<MediaTime>,
+    nominal_frame_rate: Option<f64>,
+    pool: FramePool,
+    native_buffers: bool,
 }
 
 impl AvFoundationDecoder {
@@ -39,6 +44,7 @@ impl AvFoundationDecoder {
         let native_options = Arc::new(native_options(input, options)?);
         let asset = Arc::new(AvAsset::new(native_options.clone())?);
         let duration = asset.duration();
+        let nominal_frame_rate = asset.nominal_frame_rate();
         let display_rotation = asset.display_rotation()?;
         let reader = Arc::new(AvAssetReader::new(native_options.clone(), asset.clone())?);
         let track_output = Arc::new(AvAssetReaderTrackOutput::new(
@@ -55,6 +61,9 @@ impl AvFoundationDecoder {
             track_output,
             display_rotation,
             duration,
+            nominal_frame_rate,
+            pool: FramePool::default(),
+            native_buffers: options.native_buffers,
         })
     }
 }
@@ -65,11 +74,17 @@ impl VideoDecoder for AvFoundationDecoder {
             &self.track_output.reader,
             &self.track_output,
             self.display_rotation,
+            &self.pool,
+            self.native_buffers,
         )
     }
 
     fn duration(&self) -> Option<MediaTime> {
         self.duration
+    }
+
+    fn nominal_frame_rate(&self) -> Option<f64> {
+        self.nominal_frame_rate
     }
 }
 
@@ -95,6 +110,7 @@ fn native_options(input: &Path, options: DecodeOptions) -> anyhow::Result<SEGDec
         file_path,
         output_video_format: SEGD_VIDEO_FORMAT_BGRA,
         max_dimension: options.max_dimension.unwrap_or(0),
+        native_buffers: u32::from(options.native_buffers),
     })
 }
 
@@ -142,6 +158,11 @@ impl AvAsset {
 
         DisplayRotation::from_clockwise_degrees(rotation)
             .with_context(|| format!("unsupported AVFoundation video rotation {rotation} degrees"))
+    }
+
+    fn nominal_frame_rate(&self) -> Option<f64> {
+        let rate = unsafe { segd_get_nominal_frame_rate(self.ptr) };
+        (rate.is_finite() && rate > 0.0).then_some(rate)
     }
 }
 
@@ -234,6 +255,8 @@ fn read_video_frame(
     reader: &AvAssetReader,
     track_output: &AvAssetReaderTrackOutput,
     display_rotation: DisplayRotation,
+    pool: &FramePool,
+    native_buffers: bool,
 ) -> anyhow::Result<Option<VideoFrame>> {
     let mut sample = SEGDecodedSample {
         sample_buffer: std::ptr::null_mut(),
@@ -276,10 +299,28 @@ fn read_video_frame(
     }
     let plane_size = sample_data.planes_size[0] as usize;
     let source = unsafe { std::slice::from_raw_parts(plane as *const u8, plane_size) };
-    let data = source.to_vec();
+    let data: FrameData = if native_buffers {
+        let owner = unsafe { segd_retain_pixel_buffer(&sample.sample) };
+        if owner.is_null() {
+            bail!("failed to retain decoded pixel buffer");
+        }
+        unsafe {
+            FrameData::from_native(
+                owner,
+                plane.cast(),
+                plane_size,
+                owner,
+                segd_release_pixel_buffer,
+            )
+        }
+    } else {
+        let mut data = pool.take(plane_size);
+        data.copy_from_slice(source);
+        data.into()
+    };
     let time = MediaTime::new(sample.sample.pts.value, sample.sample.pts.timescale)?;
 
-    let frame = VideoFrame::new_bgra(
+    let frame = VideoFrame::from_bgra_data(
         sample.sample.width,
         sample.sample.height,
         sample_data.bytes_per_row[0],
@@ -287,7 +328,9 @@ fn read_video_frame(
         data,
     )?;
 
-    frame.rotated(display_rotation).map(Some)
+    frame
+        .rotated(display_rotation)
+        .map(|frame| Some(frame.with_pool(pool)))
 }
 
 struct NativeSample {

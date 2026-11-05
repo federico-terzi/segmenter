@@ -47,6 +47,17 @@ typedef struct {
   uint32_t video_codec;
   uint32_t video_width;
   uint32_t video_height;
+  // Equal B/G/R values and opaque alpha, guaranteed by the mask producer.
+  uint32_t grayscale_mask;
+  // Preserve closely spaced variable-frame-rate timestamps. Zero uses the
+  // framework default for callers that do not provide a source timebase.
+  int32_t source_timescale;
+  // Zero retains existing compression. Nonzero selects standard H.264 High
+  // without B-frames at quality 0.83. File size still depends on video content.
+  uint32_t fast_h264;
+  // Finite positive nominal source FPS; zero leaves the hint unspecified.
+  // Used only by the fast preset so legacy compression stays unchanged.
+  double expected_frame_rate;
 } SEGEncodeWriterInputOptions;
 
 extern "C" void *sege_initialize_asset_writer_input(

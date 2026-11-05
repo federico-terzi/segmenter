@@ -5,7 +5,7 @@ use crate::{
     decoder::VideoDecoder,
     encoder::VideoEncoder,
     engine::Engine,
-    frame::{MediaTime, VideoFrame},
+    frame::{MediaTime, VideoFrame, VideoFrameInfo},
 };
 use anyhow::{bail, Context};
 use std::{sync::mpsc::sync_channel, thread};
@@ -19,8 +19,12 @@ pub(crate) enum Mode {
 }
 
 enum Message {
-    Duration(Option<MediaTime>),
+    Metadata {
+        duration: Option<MediaTime>,
+        frame_rate: Option<f64>,
+    },
     Frame(VideoFrame),
+    Prepare(VideoFrameInfo),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -52,6 +56,7 @@ fn run_sequential(
 ) -> anyhow::Result<u64> {
     let duration = decoder.duration();
     encoder.set_expected_duration(duration)?;
+    encoder.set_expected_frame_rate(decoder.nominal_frame_rate())?;
     progress(Progress::Started(duration));
     let mut frames = 0;
     while let Some(frame) = decoder.read_frame()? {
@@ -78,52 +83,121 @@ fn run_pipelined(
         let (mask_tx, mask_rx) = sync_channel(FRAME_QUEUE_CAPACITY);
         let decode = scope.spawn(move || -> anyhow::Result<()> {
             let mut decoder = open_decoder()?;
+            let mut work = std::time::Duration::ZERO;
+            let start = std::time::Instant::now();
             if decoded_tx
-                .send(Message::Duration(decoder.duration()))
+                .send(Message::Metadata {
+                    duration: decoder.duration(),
+                    frame_rate: decoder.nominal_frame_rate(),
+                })
                 .is_err()
             {
                 return Ok(());
             }
-            while let Some(frame) = decoder.read_frame()? {
+            loop {
+                let t = std::time::Instant::now();
+                let frame = decoder.read_frame()?;
+                work += t.elapsed();
+                let Some(frame) = frame else { break };
                 if decoded_tx.send(Message::Frame(frame)).is_err() {
                     break;
                 }
             }
+            if std::env::var_os("SEGMENTER_METAL_PROFILE").is_some() {
+                eprintln!("DECODE: work={work:?} total={:?}", start.elapsed());
+            }
             Ok(())
         });
         let encode = scope.spawn(move || -> anyhow::Result<u64> {
-            let Ok(Message::Duration(duration)) = mask_rx.recv() else {
+            let Ok(Message::Metadata {
+                duration,
+                frame_rate,
+            }) = mask_rx.recv()
+            else {
                 return Ok(0);
             };
             let mut encoder = open_encoder()?;
             encoder.set_expected_duration(duration)?;
+            encoder.set_expected_frame_rate(frame_rate)?;
             let mut frames = 0;
-            while let Ok(Message::Frame(frame)) = mask_rx.recv() {
-                encoder.send_frame(&frame)?;
-                frames += 1;
+            let mut work = std::time::Duration::ZERO;
+            let start = std::time::Instant::now();
+            while let Ok(message) = mask_rx.recv() {
+                let t = std::time::Instant::now();
+                match message {
+                    Message::Prepare(info) => encoder.prepare(info)?,
+                    Message::Frame(frame) => {
+                        encoder.send_frame(&frame)?;
+                        frames += 1;
+                    }
+                    Message::Metadata { .. } => {
+                        bail!("unexpected metadata after encoder initialization")
+                    }
+                }
+                work += t.elapsed();
             }
             if frames > 0 {
+                let t = std::time::Instant::now();
                 encoder.finalize()?;
+                if std::env::var_os("SEGMENTER_METAL_PROFILE").is_some() {
+                    eprintln!(
+                        "ENCODE: work={work:?} finalize={:?} total={:?}",
+                        t.elapsed(),
+                        start.elapsed()
+                    );
+                }
             }
             Ok(frames)
         });
 
         let processing = (|| -> anyhow::Result<u64> {
-            let Ok(Message::Duration(duration)) = decoded_rx.recv() else {
+            let Ok(Message::Metadata {
+                duration,
+                frame_rate,
+            }) = decoded_rx.recv()
+            else {
                 return Ok(0);
             };
-            if mask_tx.send(Message::Duration(duration)).is_err() {
+            if mask_tx
+                .send(Message::Metadata {
+                    duration,
+                    frame_rate,
+                })
+                .is_err()
+            {
                 return Ok(0);
             }
             progress(Progress::Started(duration));
             let mut frames = 0;
+            let mut submitted = 0;
             while let Ok(Message::Frame(frame)) = decoded_rx.recv() {
-                let mask = engine.segment(&frame)?;
+                if submitted == 0 {
+                    if let Some(info) = engine.output_frame_info(&frame) {
+                        if mask_tx.send(Message::Prepare(info)).is_err() {
+                            return Ok(0);
+                        }
+                    }
+                }
+                submitted += 1;
+                if let Some(mask) = engine.enqueue(&frame)? {
+                    let time = mask.time;
+                    if mask_tx.send(Message::Frame(mask)).is_err() {
+                        return Ok(frames);
+                    }
+                    frames += 1;
+                    progress(Progress::Frame(time, frames));
+                }
+            }
+            while let Some(mask) = engine.drain()? {
+                let time = mask.time;
                 if mask_tx.send(Message::Frame(mask)).is_err() {
-                    break;
+                    return Ok(frames);
                 }
                 frames += 1;
-                progress(Progress::Frame(frame.time, frames));
+                progress(Progress::Frame(time, frames));
+            }
+            if frames != submitted {
+                bail!("inference returned {frames} masks for {submitted} input frames");
             }
             Ok(frames)
         })();
@@ -207,6 +281,207 @@ mod tests {
         frames: Arc<Mutex<Vec<i64>>>,
         fail_at: Option<i64>,
         fail_finalize: bool,
+    }
+
+    struct DeferredEngine {
+        inner: Segmenter,
+        pending: std::collections::VecDeque<VideoFrame>,
+        fail_drain: bool,
+    }
+
+    #[test]
+    fn encoder_preparation_overlaps_inference_and_propagates_errors() {
+        use std::sync::Condvar;
+        struct PredictableEngine(Arc<(Mutex<bool>, Condvar)>);
+        impl Engine for PredictableEngine {
+            fn output_frame_info(&self, input: &VideoFrame) -> Option<VideoFrameInfo> {
+                Some(input.info())
+            }
+            fn segment(&mut self, input: &VideoFrame) -> anyhow::Result<VideoFrame> {
+                let (lock, ready) = &*self.0;
+                let (prepared, timeout) = ready
+                    .wait_timeout_while(
+                        lock.lock().unwrap(),
+                        std::time::Duration::from_secs(2),
+                        |p| !*p,
+                    )
+                    .unwrap();
+                assert!(
+                    *prepared && !timeout.timed_out(),
+                    "encoder must prepare while inference runs"
+                );
+                Ok(input.clone())
+            }
+        }
+        struct PreparingEncoder {
+            ready: Arc<(Mutex<bool>, Condvar)>,
+            fail: bool,
+            sent: usize,
+        }
+        impl VideoEncoder for PreparingEncoder {
+            fn prepare(&mut self, info: VideoFrameInfo) -> anyhow::Result<()> {
+                assert_eq!((info.width, info.height, info.time.value), (2, 2, 0));
+                let (lock, ready) = &*self.ready;
+                let mut prepared = lock.lock().unwrap();
+                assert!(!*prepared, "prepare must run only once");
+                *prepared = true;
+                ready.notify_all();
+                if self.fail {
+                    bail!("injected encoder preparation failure");
+                }
+                Ok(())
+            }
+            fn send_frame(&mut self, frame: &VideoFrame) -> anyhow::Result<()> {
+                assert!(*self.ready.0.lock().unwrap());
+                assert_eq!(frame.time.value, self.sent as i64);
+                self.sent += 1;
+                Ok(())
+            }
+            fn finalize(&mut self) -> anyhow::Result<()> {
+                assert_eq!(self.sent, 17);
+                Ok(())
+            }
+        }
+        for fail in [false, true] {
+            let ready = Arc::new((Mutex::new(false), Condvar::new()));
+            let encoder_ready = ready.clone();
+            let mut engine = PredictableEngine(ready);
+            let result = run(
+                Mode::Pipelined,
+                || {
+                    Ok(Box::new(Decoder {
+                        next: 0,
+                        count: 17,
+                        fail_at: None,
+                    }))
+                },
+                move || {
+                    Ok(Box::new(PreparingEncoder {
+                        ready: encoder_ready,
+                        fail,
+                        sent: 0,
+                    }))
+                },
+                &mut engine,
+                |_| {},
+            );
+            if fail {
+                assert!(format!("{:#}", result.unwrap_err())
+                    .contains("injected encoder preparation failure"));
+            } else {
+                assert_eq!(result.unwrap(), 17);
+            }
+        }
+    }
+
+    impl Engine for DeferredEngine {
+        fn segment(&mut self, frame: &VideoFrame) -> anyhow::Result<VideoFrame> {
+            self.inner.segment(frame)
+        }
+
+        fn enqueue(&mut self, frame: &VideoFrame) -> anyhow::Result<Option<VideoFrame>> {
+            self.pending.push_back(self.inner.segment(frame)?);
+            Ok(if self.pending.len() == 3 {
+                self.pending.pop_front()
+            } else {
+                None
+            })
+        }
+
+        fn drain(&mut self) -> anyhow::Result<Option<VideoFrame>> {
+            if self.fail_drain {
+                bail!("injected drain error");
+            }
+            Ok(self.pending.pop_front())
+        }
+    }
+
+    #[test]
+    fn queued_inference_drains_short_clips_and_reports_output_timestamps() {
+        for count in [1, 2, 3, 4, 17] {
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let captured = frames.clone();
+            let mut progress_times = Vec::new();
+            let mut engine = DeferredEngine {
+                inner: Segmenter {
+                    next: 0,
+                    fail_at: None,
+                },
+                pending: Default::default(),
+                fail_drain: false,
+            };
+            let result = run(
+                Mode::Pipelined,
+                || {
+                    Ok(Box::new(Decoder {
+                        next: 0,
+                        count,
+                        fail_at: None,
+                    }))
+                },
+                move || {
+                    Ok(Box::new(Encoder {
+                        frames: captured,
+                        fail_at: None,
+                        fail_finalize: false,
+                    }))
+                },
+                &mut engine,
+                |event| {
+                    if let Progress::Frame(time, _) = event {
+                        progress_times.push(time.value)
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(result, count as u64);
+            assert_eq!(progress_times, (0..count).collect::<Vec<_>>());
+            assert_eq!(
+                *frames.lock().unwrap(),
+                (0..count).chain([-1]).collect::<Vec<_>>()
+            );
+            assert!(engine.pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn queued_inference_errors_disconnect_workers_with_pending_frames() {
+        for (decode, infer, encode, drain, expected) in [
+            (Some(1), None, None, false, "injected decoder error"),
+            (None, Some(1), None, false, "injected inference error"),
+            (None, None, Some(1), false, "injected encoder error"),
+            (None, None, None, true, "injected drain error"),
+        ] {
+            let mut engine = DeferredEngine {
+                inner: Segmenter {
+                    next: 0,
+                    fail_at: infer,
+                },
+                pending: Default::default(),
+                fail_drain: drain,
+            };
+            let error = run(
+                Mode::Pipelined,
+                || {
+                    Ok(Box::new(Decoder {
+                        next: 0,
+                        count: 17,
+                        fail_at: decode,
+                    }))
+                },
+                || {
+                    Ok(Box::new(Encoder {
+                        frames: Arc::default(),
+                        fail_at: encode,
+                        fail_finalize: false,
+                    }))
+                },
+                &mut engine,
+                |_| {},
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
     }
     impl VideoEncoder for Encoder {
         fn send_frame(&mut self, frame: &VideoFrame) -> anyhow::Result<()> {
@@ -423,6 +698,10 @@ mod tests {
             self.check_thread();
             Some(MediaTime::new(2, 30).unwrap())
         }
+        fn nominal_frame_rate(&self) -> Option<f64> {
+            self.check_thread();
+            Some(30000.0 / 1001.0)
+        }
         fn read_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
             self.check_thread();
             if self.frames == 2 {
@@ -440,6 +719,12 @@ mod tests {
         }
     }
     impl VideoEncoder for ThreadBoundStage {
+        fn set_expected_frame_rate(&mut self, rate: Option<f64>) -> anyhow::Result<()> {
+            self.check_thread();
+            assert_eq!(self.frames, 0);
+            assert_eq!(rate, Some(30000.0 / 1001.0));
+            Ok(())
+        }
         fn set_expected_duration(&mut self, duration: Option<MediaTime>) -> anyhow::Result<()> {
             self.check_thread();
             assert_eq!(duration, Some(MediaTime::new(2, 30)?));
