@@ -128,7 +128,10 @@ def ensure_targets_installed(targets):
 def build_targets(targets):
     for target in targets:
         log(f"building {target}")
-        run(["cargo", "build", "--release", "--target", target])
+        command = ["cargo", "build", "--release", "--target", target]
+        if target == "x86_64-apple-darwin":
+            command.extend(["--features", "engine-onnx"])
+        run(command)
 
 
 def sha256(path):
