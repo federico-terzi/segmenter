@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 
 use crate::frame::VideoFrame;
 
@@ -93,7 +93,7 @@ fn create_onnx_engine(options: EngineOptions) -> anyhow::Result<Box<dyn Engine>>
     )
 )))]
 fn create_onnx_engine(_options: EngineOptions) -> anyhow::Result<Box<dyn Engine>> {
-    bail!("the .onnx engine is not enabled; rebuild with --features engine-onnx")
+    anyhow::bail!("the .onnx engine is not enabled; rebuild with --features engine-onnx")
 }
 
 #[cfg(all(target_os = "macos", feature = "engine-metal"))]
@@ -106,12 +106,12 @@ fn create_metal_engine(options: EngineOptions) -> anyhow::Result<Box<dyn Engine>
 
 #[cfg(all(target_os = "macos", not(feature = "engine-metal")))]
 fn create_metal_engine(_options: EngineOptions) -> anyhow::Result<Box<dyn Engine>> {
-    bail!("the .rvmmetal engine is not enabled; rebuild with --features engine-metal")
+    anyhow::bail!("the .rvmmetal engine is not enabled; rebuild with --features engine-metal")
 }
 
 #[cfg(not(target_os = "macos"))]
 fn create_metal_engine(_options: EngineOptions) -> anyhow::Result<Box<dyn Engine>> {
-    bail!("the .rvmmetal engine is only available on macOS with --features engine-metal")
+    anyhow::bail!("the .rvmmetal engine is only available on macOS with --features engine-metal")
 }
 
 #[cfg(test)]
