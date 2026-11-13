@@ -1069,6 +1069,25 @@ void build_concat(BuildContext &build, const NodeDef &node) {
     set_output(build, node, std::move(output));
 }
 
+NSArray<MPSGraphTensor *> *split_tensor(MPSGraph *graph, MPSGraphTensor *input,
+                                       NSArray<NSNumber *> *sizes, int64_t axis) {
+#if defined(__x86_64__)
+    // macOS 12 MPSGraph can abort on Intel while extracting RVM's final alpha
+    // split. Equivalent slices avoid the texture-cache assertion.
+    NSMutableArray<MPSGraphTensor *> *outputs = [NSMutableArray arrayWithCapacity:sizes.count];
+    NSInteger offset = 0;
+    for (NSNumber *size in sizes) {
+        const NSInteger length = size.integerValue;
+        [outputs addObject:[graph sliceTensor:input dimension:axis start:offset length:length name:nil]];
+        offset += length;
+    }
+    return outputs;
+#else
+    // Preserve the faster native Split operation on Apple Silicon.
+    return [graph splitTensor:input splitSizes:sizes axis:axis name:nil];
+#endif
+}
+
 void build_split(BuildContext &build, const NodeDef &node) {
     if (node.outputs.empty() || node.inputs.size() != 1 || node.attrs.empty()) {
         fail("invalid Split node in RVM Metal model");
@@ -1089,10 +1108,8 @@ void build_split(BuildContext &build, const NodeDef &node) {
     }
 
     NSArray<NSNumber *> *split_sizes = make_numbers_u32(sizes);
-    NSArray<MPSGraphTensor *> *split = [build.runtime->graph splitTensor:build.ensure_tensor(input)
-                                                               splitSizes:split_sizes
-                                                                     axis:axis
-                                                                     name:nil];
+    NSArray<MPSGraphTensor *> *split = split_tensor(build.runtime->graph, build.ensure_tensor(input),
+                                                  split_sizes, axis);
     if ([split count] != node.outputs.size()) {
         fail("MPSGraph returned an unexpected Split output count");
     }
